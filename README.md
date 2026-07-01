@@ -1,4 +1,4 @@
-![1782875638926](image/README/1782875638926.png)
+![ZWU_AUTO_BOOK_NEXT_logo](image/readme/ZWU_AUTO_BOOK_NEXT_logo.png)
 
 # ZWU AUTO BOOK NEXT浙江万里学院图书馆自动预约脚本
 
