@@ -1,0 +1,16 @@
+[
+    {
+        "username": "学号1",
+        "password": "密码1"
+    },
+    {
+        "username": "学号2",
+        "password": "密码2",
+        "room_id": 4,
+        "dday": 2,
+        "begin": 21,
+        "duration": 9,
+        "seat_ids": [12920, 12921],
+        "max-retry": 20
+    }
+]
