@@ -123,19 +123,95 @@ max-retry: 20          # 最多重试20次
 
 ### 6. 完成 ✅
 
-* 配置完成后，你可以在 **Actions** 页签中点击 **Run workflow** 手动触发预约。
-* 定时触发已配置（北京时间 20:57），但**未成功测试**，不建议依赖。
+配置完成后，你可以在 **Actions** 页签中点击 **Run workflow** 手动触发预约。
 
 > [!CAUTION]
-> **关于定时触发的说明：**
+> **关于 GitHub Actions 定时触发：**
 >
-> - GitHub Actions 的 `schedule` 触发机制**不稳定**，可能延迟或完全不触发
-> - **不建议依赖定时功能进行抢座**，建议使用手动触发或本地运行
-> - 如果一定要使用定时，请确保：
->   1. `config/booking_config.yml` 中 `begin` 时间设为预约开放时间
->   2. cron 时间设为比 `begin` 早 3-5 分钟
->   3. 保持仓库活跃（定期手动触发或推送代码）
->   4. 设置正确的 Workflow permissions（Read and write）
+> * GitHub Actions 的 `schedule` 触发机制**不稳定**，经常延迟数分钟甚至完全不触发。
+> * 本项目已**不再依赖** GitHub 自带的定时触发，而是使用下文介绍的 **cron-job.org** 来实现精确到秒的定时调用。
+> * 工作流文件中的 `schedule` 已被注释，仅保留作为语法参考。
+
+---
+
+### 7. (推荐) 使用 cron-job.org 精确触发定时任务
+
+[cron-job.org](https://cron-job.org) 是一个免费的定时任务服务，它会准时向你的 GitHub 仓库发送 HTTP 请求，触发 Actions 工作流。相比 GitHub 自带的 `schedule`，它**延迟极低（秒级）且不会跳过执行**。
+
+#### 7.1 生成 GitHub Personal Access Token
+
+cron-job.org 需要通过 GitHub API 触发工作流，需要一个有 `workflow` 权限的 Token：
+
+1. 打开 [GitHub Token 设置页](https://github.com/settings/tokens)
+2. 点击 **Generate new token (classic)** → 给个名字（如 `cron-job-trigger`）
+3. 勾选权限：**`workflow`**（只需要这一个 scope）
+4. 点击生成，**复制并保存好 Token**（页面关闭后就看不到了）
+
+> 这个 Token 只会用来触发工作流，没有读取代码或管理仓库的其他权限。
+
+#### 7.2 配置 cron-job.org
+
+1. 访问 [cron-job.org](https://cron-job.org)，注册账号并登录
+2. 点击 **Create Cron Job** 进入配置页
+
+##### 请求 URL
+
+填写 GitHub Actions 的 API dispatch 地址（替换 `你的用户名` 和 `你的仓库名`）：
+
+```
+https://api.github.com/repos/你的用户名/ZWU_AUTO_BOOK_NEXT/actions/workflows/main.yml/dispatches
+```
+
+##### 请求头（Request Headers）
+
+添加以下两个 Header：
+
+| Header            | 值                                 | 说明                |
+| ----------------- | ---------------------------------- | ------------------- |
+| `Authorization` | `Bearer 你的PersonalAccessToken` | 上一步生成的 Token  |
+| `Accept`        | `application/vnd.github+json`    | GitHub API 版本声明 |
+| `Content-Type`  | `application/json`               | 请求体格式声明      |
+
+##### 请求体（Request Body）
+
+选择请求方法为 **POST**，在 Body 中输入：
+
+```json
+{"ref": "main"}
+```
+
+这告诉 GitHub 使用 `main` 分支的最新代码来运行工作流。
+
+##### 执行计划（Schedule）
+
+设置与你预约时间匹配的 cron 表达式。例如你的预约开始时间 `begin` 设在 21:00（晚上9点）：
+
+```
+0 21 * * *
+```
+
+表示每天 **北京时间 21:00** 触发（cron-job.org 默认使用 UTC+8，不需要做时区转换）。
+
+> [!TIP]
+> cron 表达式格式为 `分 时 日 月 周`。`0 21 * * *` 表示每天 21:00 执行。
+> 无需像 GitHub Actions 那样转换 UTC 时间，cron-job.org 直接使用北京时间（UTC+8）。
+
+##### 其他设置
+
+- **Title**：随意填写，如 `ZWU Auto Book`
+- **Save successful executions**：建议开启，方便查看运行历史
+
+点击 **Create** 完成配置。
+
+#### 7.3 验证配置
+
+1. 在 cron-job.org 仪表盘上，点击 **Run** 手动执行一次（免费版似乎不支持测试，但不影响定时任务执行）
+2. 回到 GitHub 仓库 → **Actions** 页签，应该能看到一个新的 workflow 正在运行
+3. 点进去查看日志，确认预约脚本正常执行
+
+之后每天到了设定时间，cron-job.org 会准时向 GitHub 发送请求，误差通常在 **1-2 秒以内**，远超 GitHub 自带的 schedule 稳定性。
+
+![配置cron-job.org](image/README/配置cron-job.org.png)
 
 ---
 
@@ -223,6 +299,8 @@ ZWU图书馆助手
 - 状态: ❌ 预约失败
 - 原因: 已有预约，请勿重复预约！
 ```
+
+> Server酱支持多种通知渠道配置，例如可以连接飞书机器人以webhook方式通知，支持加入群聊进行群通知。
 
 ### 邮件通知（未测试）
 

@@ -2,8 +2,8 @@ name: ZWU Auto BOOK
 
 on:
   workflow_dispatch:  # 支持手动触发
-  schedule:
-    - cron: '57 12 * * *'  # UTC 12:57 = 北京时间 20:57
+  # schedule:
+  #   - cron: '57 12 * * *'  # UTC 12:57 = 北京时间 20:57（已改用 cron-job.org 触发，见 README）
 
 permissions:
   contents: read
