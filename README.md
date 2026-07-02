@@ -134,6 +134,9 @@ max-retry: 20          # 最多重试20次
 
 ---
 
+<details>
+<summary>📖 点击展开 cron-job.org 精确定时触发配置教程</summary>
+
 ### 7. (推荐) 使用 cron-job.org 精确触发定时任务
 
 [cron-job.org](https://cron-job.org) 是一个免费的定时任务服务，它会准时向你的 GitHub 仓库发送 HTTP 请求，触发 Actions 工作流。相比 GitHub 自带的 `schedule`，它**延迟极低（秒级）且不会跳过执行**。
@@ -211,7 +214,9 @@ https://api.github.com/repos/你的用户名/ZWU_AUTO_BOOK_NEXT/actions/workflow
 
 之后每天到了设定时间，cron-job.org 会准时向 GitHub 发送请求，误差通常在 **1-2 秒以内**，远超 GitHub 自带的 schedule 稳定性。
 
-![配置cron-job.org](image/README/配置cron-job.org.png)
+![配置cron-job](image/readme/配置cron-job.png)
+
+</details>
 
 ---
 
