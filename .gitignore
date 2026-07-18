@@ -44,3 +44,6 @@ drivers/
 
 # 日志
 *.log
+
+# 设计素材
+image/圆形徽标设计.png
