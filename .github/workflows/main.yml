@@ -31,4 +31,8 @@ jobs:
           ACCOUNTS: ${{ secrets.ACCOUNTS }}              # 老用法（后向兼容，保留）
           ACCOUNTS_CONFIG: ${{ vars.ACCOUNTS_CONFIG }}    # 新用法：明文 Variable（账号清单 + 覆盖配置）
           PASSWORDS: ${{ secrets.PASSWORDS }}             # 新用法：密码映射 Secret（{学号: 密码}）
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}     # 飞书方案：应用 App ID
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}  # 飞书方案：应用 App Secret
+          FEISHU_APP_TOKEN: ${{ secrets.FEISHU_APP_TOKEN }}    # 飞书方案：多维表格 app_token
+          FEISHU_TABLE_ID: ${{ secrets.FEISHU_TABLE_ID }}      # 飞书方案：多维表格 table_id
         run: python demo.py
