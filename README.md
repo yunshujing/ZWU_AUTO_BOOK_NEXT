@@ -260,11 +260,21 @@
 
 #### 4. 获取 app_token 和 table_id
 
-从多维表格的 URL 里取：
+从多维表格的 URL 里取，格式如下：
 
 ```
-https://xxx.feishu.cn/base/{app_token}/table/{table_id}
+https://xxx.feishu.cn/base/{app_token}?table={table_id}&view=...
 ```
+
+例如：
+
+```
+https://my.feishu.cn/base/MbJDbRExgaZ480sbPtacBLhIn74?table=tblEE9NPwSB3WPKQ&view=vewzhxRS50
+                         └──── app_token ────┘       └── table_id ──┘
+```
+
+> [!CAUTION]
+> URL 必须是 `/base/` 开头。如果是 `/wiki/` 开头，说明表格建在了知识库里，请回到第 2 步在 **云盘** 里重新创建。
 
 #### 5. 配置 GitHub Secrets
 
