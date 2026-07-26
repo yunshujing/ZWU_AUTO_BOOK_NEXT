@@ -74,7 +74,8 @@ def _ensure_no_local_file():
 
 
 def _clean_env():
-    for k in ('ACCOUNTS', 'ACCOUNTS_CONFIG', 'PASSWORDS'):
+    for k in ('ACCOUNTS', 'ACCOUNTS_CONFIG', 'PASSWORDS',
+              'FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'FEISHU_APP_TOKEN', 'FEISHU_TABLE_ID'):
         os.environ.pop(k, None)
 
 
@@ -265,6 +266,267 @@ def test_8_enabled_field_not_in_params():
     print("[PASS] enabled field properly excluded from params")
 
 
+# ============================================
+# Feishu (Lark Base) mock tests
+# ============================================
+
+class _FakeResponse:
+    """Mock requests.Response for feishu tests."""
+    def __init__(self, json_data):
+        self._data = json_data
+    def json(self):
+        return self._data
+
+
+def _mock_feishu_api(token_resp, records_resp_list, monkey_requests):
+    """
+    Set up mock for requests.post (token) and requests.get (records).
+    records_resp_list: list of page responses (for pagination testing)
+    """
+    call_idx = {'i': 0}
+
+    def fake_post(url, **kwargs):
+        return _FakeResponse(token_resp)
+
+    def fake_get(url, **kwargs):
+        idx = call_idx['i']
+        call_idx['i'] += 1
+        if idx < len(records_resp_list):
+            return _FakeResponse(records_resp_list[idx])
+        return _FakeResponse({'code': 0, 'data': {'items': [], 'has_more': False}})
+
+    monkey_requests.post = fake_post
+    monkey_requests.get = fake_get
+
+
+def test_9_feishu_normal():
+    print("\n" + "=" * 60)
+    print("Test 9: feishu normal path - mock API + PASSWORDS merge")
+    print("=" * 60)
+    _ensure_no_local_file()
+    _clean_env()
+    os.environ['FEISHU_APP_ID'] = 'fake_app_id'
+    os.environ['FEISHU_APP_SECRET'] = 'fake_secret'
+    os.environ['FEISHU_APP_TOKEN'] = 'fake_token'
+    os.environ['FEISHU_TABLE_ID'] = 'fake_table'
+    os.environ['PASSWORDS'] = json.dumps({"20210001": "pwd1", "20210002": "pwd2"})
+
+    token_resp = {'code': 0, 'tenant_access_token': 't-fake', 'expire': 7200}
+    records_resp = {
+        'code': 0,
+        'data': {
+            'items': [
+                {'record_id': 'rec1', 'fields': {'username': '20210001', 'enabled': True, 'room_id': 2, 'begin': 12}},
+                {'record_id': 'rec2', 'fields': {'username': '20210002', 'enabled': False, 'room_id': 4, 'begin': 21, 'seat_ids': '12920,12921'}},
+            ],
+            'has_more': False,
+        }
+    }
+
+    demo = _reload_demo()
+    import types
+    fake_requests = types.SimpleNamespace()
+    _mock_feishu_api(token_resp, [records_resp], fake_requests)
+    demo.requests = fake_requests
+
+    accounts = demo.load_accounts()
+    assert len(accounts) == 2, "expected 2 accounts, got %d" % len(accounts)
+    assert accounts[0]['username'] == '20210001'
+    assert accounts[0]['password'] == 'pwd1'
+    assert accounts[0]['room_id'] == 2
+    assert accounts[0]['begin'] == 12
+    assert accounts[0]['enabled'] is True
+    assert accounts[1]['username'] == '20210002'
+    assert accounts[1]['password'] == 'pwd2'
+    assert accounts[1]['seat_ids'] == [12920, 12921]
+    assert accounts[1]['enabled'] is False
+    print("[PASS] feishu normal: 2 accounts loaded, fields parsed, passwords merged")
+
+
+def test_10_feishu_pagination():
+    print("\n" + "=" * 60)
+    print("Test 10: feishu pagination - multiple pages")
+    print("=" * 60)
+    _ensure_no_local_file()
+    _clean_env()
+    os.environ['FEISHU_APP_ID'] = 'fake_app_id'
+    os.environ['FEISHU_APP_SECRET'] = 'fake_secret'
+    os.environ['FEISHU_APP_TOKEN'] = 'fake_token'
+    os.environ['FEISHU_TABLE_ID'] = 'fake_table'
+    os.environ['PASSWORDS'] = json.dumps({"a": "pa", "b": "pb", "c": "pc"})
+
+    token_resp = {'code': 0, 'tenant_access_token': 't-fake', 'expire': 7200}
+    page1 = {
+        'code': 0,
+        'data': {
+            'items': [{'record_id': 'r1', 'fields': {'username': 'a'}}],
+            'has_more': True,
+            'page_token': 'next',
+        }
+    }
+    page2 = {
+        'code': 0,
+        'data': {
+            'items': [{'record_id': 'r2', 'fields': {'username': 'b'}}, {'record_id': 'r3', 'fields': {'username': 'c'}}],
+            'has_more': False,
+        }
+    }
+
+    demo = _reload_demo()
+    import types
+    fake_requests = types.SimpleNamespace()
+    _mock_feishu_api(token_resp, [page1, page2], fake_requests)
+    demo.requests = fake_requests
+
+    accounts = demo.load_accounts()
+    assert len(accounts) == 3, "expected 3 accounts (pagination), got %d" % len(accounts)
+    usernames = [a['username'] for a in accounts]
+    assert usernames == ['a', 'b', 'c']
+    print("[PASS] feishu pagination: 3 accounts across 2 pages")
+
+
+def test_11_feishu_missing_secrets():
+    print("\n" + "=" * 60)
+    print("Test 11: feishu fail loud - missing FEISHU secrets")
+    print("=" * 60)
+    _ensure_no_local_file()
+    _clean_env()
+    os.environ['FEISHU_APP_ID'] = 'fake_app_id'
+    # Missing other 3 feishu secrets
+
+    demo = _reload_demo()
+    accounts = demo.load_accounts()
+    assert accounts == [], "missing feishu secrets should return empty list"
+    print("[PASS] feishu missing secrets -> fail loud returns empty")
+
+
+def test_12_feishu_token_error():
+    print("\n" + "=" * 60)
+    print("Test 12: feishu fail loud - token API error")
+    print("=" * 60)
+    _ensure_no_local_file()
+    _clean_env()
+    os.environ['FEISHU_APP_ID'] = 'fake_app_id'
+    os.environ['FEISHU_APP_SECRET'] = 'fake_secret'
+    os.environ['FEISHU_APP_TOKEN'] = 'fake_token'
+    os.environ['FEISHU_TABLE_ID'] = 'fake_table'
+    os.environ['PASSWORDS'] = json.dumps({"a": "pa"})
+
+    token_resp = {'code': 99991663, 'msg': 'invalid app_id'}
+
+    demo = _reload_demo()
+    import types
+    fake_requests = types.SimpleNamespace()
+    _mock_feishu_api(token_resp, [], fake_requests)
+    demo.requests = fake_requests
+
+    accounts = demo.load_accounts()
+    assert accounts == [], "token error should return empty list"
+    print("[PASS] feishu token error -> fail loud returns empty")
+
+
+def test_13_feishu_records_error():
+    print("\n" + "=" * 60)
+    print("Test 13: feishu fail loud - records API error (permission)")
+    print("=" * 60)
+    _ensure_no_local_file()
+    _clean_env()
+    os.environ['FEISHU_APP_ID'] = 'fake_app_id'
+    os.environ['FEISHU_APP_SECRET'] = 'fake_secret'
+    os.environ['FEISHU_APP_TOKEN'] = 'fake_token'
+    os.environ['FEISHU_TABLE_ID'] = 'fake_table'
+    os.environ['PASSWORDS'] = json.dumps({"a": "pa"})
+
+    token_resp = {'code': 0, 'tenant_access_token': 't-fake', 'expire': 7200}
+    records_resp = {'code': 1254030, 'msg': 'no permission'}
+
+    demo = _reload_demo()
+    import types
+    fake_requests = types.SimpleNamespace()
+    _mock_feishu_api(token_resp, [records_resp], fake_requests)
+    demo.requests = fake_requests
+
+    accounts = demo.load_accounts()
+    assert accounts == [], "records API error should return empty list"
+    print("[PASS] feishu records error -> fail loud returns empty")
+
+
+def test_14_feishu_password_missing():
+    print("\n" + "=" * 60)
+    print("Test 14: feishu - partial password missing in PASSWORDS")
+    print("=" * 60)
+    _ensure_no_local_file()
+    _clean_env()
+    os.environ['FEISHU_APP_ID'] = 'fake_app_id'
+    os.environ['FEISHU_APP_SECRET'] = 'fake_secret'
+    os.environ['FEISHU_APP_TOKEN'] = 'fake_token'
+    os.environ['FEISHU_TABLE_ID'] = 'fake_table'
+    os.environ['PASSWORDS'] = json.dumps({"has_pwd": "secret"})
+
+    token_resp = {'code': 0, 'tenant_access_token': 't-fake', 'expire': 7200}
+    records_resp = {
+        'code': 0,
+        'data': {
+            'items': [
+                {'record_id': 'r1', 'fields': {'username': 'has_pwd'}},
+                {'record_id': 'r2', 'fields': {'username': 'no_pwd'}},
+            ],
+            'has_more': False,
+        }
+    }
+
+    demo = _reload_demo()
+    import types
+    fake_requests = types.SimpleNamespace()
+    _mock_feishu_api(token_resp, [records_resp], fake_requests)
+    demo.requests = fake_requests
+
+    accounts = demo.load_accounts()
+    assert len(accounts) == 1, "expected 1 account (1 missing pwd), got %d" % len(accounts)
+    assert accounts[0]['username'] == 'has_pwd'
+    print("[PASS] feishu partial password missing -> skip with warning")
+
+
+def test_15_feishu_text_field_as_list():
+    print("\n" + "=" * 60)
+    print("Test 15: feishu - text field returns list format")
+    print("=" * 60)
+    _ensure_no_local_file()
+    _clean_env()
+    os.environ['FEISHU_APP_ID'] = 'fake_app_id'
+    os.environ['FEISHU_APP_SECRET'] = 'fake_secret'
+    os.environ['FEISHU_APP_TOKEN'] = 'fake_token'
+    os.environ['FEISHU_TABLE_ID'] = 'fake_table'
+    os.environ['PASSWORDS'] = json.dumps({"20210001": "pwd1"})
+
+    token_resp = {'code': 0, 'tenant_access_token': 't-fake', 'expire': 7200}
+    # Feishu text fields sometimes return [{"text": "value"}] format
+    records_resp = {
+        'code': 0,
+        'data': {
+            'items': [
+                {'record_id': 'r1', 'fields': {
+                    'username': [{'text': '20210001'}],
+                    'seat_ids': [{'text': '12920,12921'}],
+                }},
+            ],
+            'has_more': False,
+        }
+    }
+
+    demo = _reload_demo()
+    import types
+    fake_requests = types.SimpleNamespace()
+    _mock_feishu_api(token_resp, [records_resp], fake_requests)
+    demo.requests = fake_requests
+
+    accounts = demo.load_accounts()
+    assert len(accounts) == 1, "expected 1 account, got %d" % len(accounts)
+    assert accounts[0]['username'] == '20210001'
+    assert accounts[0]['seat_ids'] == [12920, 12921]
+    print("[PASS] feishu list-format text fields parsed correctly")
+
+
 if __name__ == '__main__':
     tests = [
         test_1_old_accounts_compat,
@@ -275,6 +537,13 @@ if __name__ == '__main__':
         test_6_invalid_json,
         test_7_local_file_priority,
         test_8_enabled_field_not_in_params,
+        test_9_feishu_normal,
+        test_10_feishu_pagination,
+        test_11_feishu_missing_secrets,
+        test_12_feishu_token_error,
+        test_13_feishu_records_error,
+        test_14_feishu_password_missing,
+        test_15_feishu_text_field_as_list,
     ]
     passed, failed = 0, 0
     for t in tests:
