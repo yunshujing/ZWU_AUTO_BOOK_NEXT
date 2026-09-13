@@ -43,7 +43,7 @@
 
 - 🔐 **自动登录** — Selenium headless Chrome，无需手动操作
 - 🪑 **智能选座** — 自动搜索可用座位，优先偶数编号（假设有插座）
-- 🎯 **指定座位** — 支持指定座位 ID，按优先级依次尝试
+- 🎯 **指定座位** — 直接填座位号（自动转换ID）或座位ID，按优先级依次尝试
 - ⏰ **手动/定时预约** — 支持手动触发，也可配置 GitHub Actions 定时触发
 - 💬 **微信通知** — Server酱推送预约结果（成功含日期时间座位，失败含原因）
 - 👥 **多账号管理** — 支持多账号，每个账号可单独配置参数
@@ -101,7 +101,7 @@
         "room_id": 4,
         "begin": 21,
         "duration": 9,
-        "seat_ids": [12920, 12921]
+        "seats": [113, 114]
     },
     {
         "username": "学号3",
@@ -148,7 +148,8 @@
 | `dday`      | int  | 2              | 延后天数（1=明天，2=后天）                                 |
 | `begin`     | int  | 12             | 开始时间（8=8:00，21=21:00）                               |
 | `duration`  | int  | 9              | 持续时长（小时）                                           |
-| `seat_ids`  | list | [12920, 12921] | 指定座位 ID，null 则随机选                                 |
+| `seat_ids`  | list | [12920, 12921] | 指定座位 ID，null 则随机选 |
+| `seats`     | list | null           | 指定座位号（选座页显示的编号），如 `[113, 114]`，自动转换为座位ID；与 `seat_ids` 同时配置时以 `seat_ids` 为准 |
 | `max-retry` | int  | 20             | 最大重试次数                                               |
 
 > 未填写的字段使用 `config/booking_config.yml` 中的默认值。
@@ -247,6 +248,7 @@
 | `begin`     | 数字     | 开始时间（8=8:00，21=21:00）                |
 | `duration`  | 数字     | 持续时长（小时）                            |
 | `seat_ids`  | 文本     | 座位ID，逗号分隔，如 `12920,12921`          |
+| `seats`     | 文本     | 座位号，逗号分隔，如 `113,114`，自动转换为座位ID；与 `seat_ids` 同时填写时以 `seat_ids` 为准 |
 | `max-retry` | 数字     | 最大重试次数                                |
 
 3. 填入你的账号数据，每行一个账号。未填写的字段使用 `booking_config.yml` 默认值
@@ -310,9 +312,12 @@ room_id: 2        # 自习室编号（0-8）
 dday: 2           # 延后天数（2=后天）
 begin: 12         # 开始时间（12=中午12点）
 duration: 9       # 持续时长（小时）
-seat_ids:         # 指定座位ID（null=随机选）
-  - 12920
-  - 12921
+seats:            # 指定座位号（选座页显示的编号，自动转换为座位ID）
+  - 113
+  - 114
+# seat_ids:       # 也可以直接指定座位ID（与 seats 同时配置时以 seat_ids 为准）
+#   - 12920
+#   - 12921
 
 max-retry: 20          # 最多重试20次
 ```
@@ -434,6 +439,16 @@ https://api.github.com/repos/你的用户名/ZWU_AUTO_BOOK_NEXT/actions/workflow
 |  7  | 自习室313 |  224  | 11550-14848 |
 |  8  | 自习室314 |  174  | 11376-11549 |
 
+> [!TIP]
+> **座位号 → 座位ID 快速查询**（不用开 Excel）：
+>
+> ```bash
+> python seatmap.py 2 113    # 查自习室114的113号座位 → 输出 12920
+> python seatmap.py 2        # 打印自习室114全部座位映射
+> ```
+>
+> 配置里也可以直接填座位号（`seats: [113, 114]`），预约时自动转换，无需手动查。
+
 ---
 
 ## 📦 配置参数说明
@@ -445,6 +460,7 @@ https://api.github.com/repos/你的用户名/ZWU_AUTO_BOOK_NEXT/actions/workflow
 | `begin`              | int | 21             | 开始时间（8=8:00，21=21:00）    |
 | `duration`           | int | 9              | 持续时长（小时）                |
 | `seat_ids`           | list | [12920, 12921] | 指定座位 ID，null 则随机选      |
+| `seats`              | list | null           | 指定座位号（自动转换为座位ID），与 `seat_ids` 同时配置时以 `seat_ids` 为准 |
 | `cron-delta-minutes` | int | 5              | ⚠️ 已废弃，脚本启动后直接预约 |
 | `max-retry`          | int | 20             | 最大重试次数                    |
 | `notification_type`  | str | none           | 通知方式：none / wechat / email |
@@ -491,7 +507,7 @@ ZWU图书馆助手
 - 时间: 12:00 ~ 21:00
 - 持续时长: 9h
 - 自习室: 自习室114
-- 座位号: 10
+- 座位号: 113
 - 座位ID: 12920
 ```
 
@@ -584,9 +600,11 @@ python update_driver.py
 ZWU_AUTO_BOOK_NEXT/
 ├── demo.py                          # 入口文件
 ├── zwulib.py                        # 核心库（登录/搜座/抢座）
+├── seatmap.py                       # 座位号→座位ID 映射转换 + 命令行查询工具
 ├── notice.py                        # 通知模块（Server酱 + 邮件）
 ├── update_driver.py                 # ChromeDriver 自动更新工具（本地用）
 ├── test_config_layering.py          # 配置分层测试（8项场景全覆盖）
+├── test_seatmap.py                  # 座位号转换测试（12项场景全覆盖）
 ├── _config.yml                      # API 配置
 ├── requirements.txt                 # Python 依赖
 ├── zwu_lib.xlsx                     # 座位信息映射表

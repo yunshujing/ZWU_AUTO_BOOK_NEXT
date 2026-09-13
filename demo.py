@@ -4,6 +4,7 @@ import yaml
 import requests
 from zwulib import appoint_zwulib
 from notice import notify, notify_fail
+from seatmap import resolve_seats
 
 # ============================================
 # 配置加载：账号从 accounts_config.json 读取，预约参数从 booking_config.yml 读取
@@ -143,6 +144,18 @@ def _load_accounts_split(accounts_cfg_str):
     return _merge_passwords(accounts_cfg)
 
 
+def _parse_int_list_field(raw):
+    """
+    解析飞书文本字段为整数列表: "12920,12921" -> [12920, 12921]
+    兼容 [{"text": "..."}] 列表格式（飞书文本字段有时返回这种结构）
+    """
+    if isinstance(raw, list):
+        text = ''.join(item.get('text', '') for item in raw if isinstance(item, dict))
+    else:
+        text = str(raw)
+    return [int(s.strip()) for s in text.split(',') if s.strip()]
+
+
 def _load_accounts_from_feishu():
     """
     从飞书多维表格读取账号配置，从 PASSWORDS (Secret) 查密码。
@@ -244,16 +257,18 @@ def _load_accounts_from_feishu():
                 except (ValueError, TypeError):
                     acc[key] = val
 
-        # seat_ids: 文本字段 "12920,12921" -> [12920, 12921]
-        seat_raw = fields.get('seat_ids')
-        if seat_raw:
-            if isinstance(seat_raw, list):
-                seat_text = ''.join(item.get('text', '') for item in seat_raw if isinstance(item, dict))
-            else:
-                seat_text = str(seat_raw)
-            seat_ids = [int(s.strip()) for s in seat_text.split(',') if s.strip()]
-            if seat_ids:
-                acc['seat_ids'] = seat_ids
+        # seat_ids / seats: 文本字段 "12920,12921" -> [12920, 12921]
+        # seats 是座位号（选座页显示的编号），预约前自动转换为座位ID
+        for key in ('seat_ids', 'seats'):
+            raw = fields.get(key)
+            if raw:
+                try:
+                    ids = _parse_int_list_field(raw)
+                except ValueError:
+                    print(f"警告: 飞书表格 {key} 字段含非数字内容，已忽略该字段: {raw}")
+                    continue
+                if ids:
+                    acc[key] = ids
 
         accounts_cfg.append(acc)
 
@@ -263,6 +278,49 @@ def _load_accounts_from_feishu():
 
     # 第四步: 合并密码
     return _merge_passwords(accounts_cfg)
+
+
+def _seats_to_ids(account, defaults, seats):
+    """座位号查表转换为座位ID，并打印转换结果供确认"""
+    room_id = account['room_id'] if account.get('room_id') is not None else defaults.get('room_id')
+    seat_ids = resolve_seats(room_id, seats)
+    if seat_ids:
+        print(f"座位号 {seats} → 座位ID {seat_ids}")
+    else:
+        print("警告: 所有座位号均无效，将随机选座")
+    return seat_ids
+
+
+def resolve_final_seats(account, defaults):
+    """
+    决定账号最终使用的 seat_ids（座位号 seats 已查表转换），返回 seat_ids 列表，
+    两层都未配置任何座位时返回 None（随机选座）。
+
+    层级: 账号级显式配置 > 默认层（booking_config.yml），
+    否则默认层的 seat_ids 会永远挡住账号级的座位号。
+    同层同时配置 seat_ids 和 seats 时，以 seat_ids（显式平台ID）为准并警告。
+    """
+    acc_ids = account.get('seat_ids')
+    acc_seats = account.get('seats')
+
+    if acc_ids is not None or acc_seats is not None:
+        if acc_ids is not None and acc_seats is not None:
+            print(f"警告: 同时配置了 seat_ids={acc_ids} 和 seats={acc_seats}，以 seat_ids 为准")
+            return acc_ids
+        if acc_ids is not None:
+            return acc_ids
+        return _seats_to_ids(account, defaults, acc_seats)
+
+    def_ids = defaults.get('seat_ids')
+    def_seats = defaults.get('seats')
+    if def_ids is not None and def_seats is not None:
+        print(f"警告: 同时配置了 seat_ids={def_ids} 和 seats={def_seats}，以 seat_ids 为准")
+        return def_ids
+    if def_ids is not None:
+        return def_ids
+    if def_seats is not None:
+        return _seats_to_ids(account, defaults, def_seats)
+    return None
 
 
 def load_booking_config():
@@ -315,6 +373,9 @@ if __name__ == '__main__':
         # 合并: 账号级覆盖 > 默认配置（排除 username/password/enabled 等非预约参数）
         params = {**defaults, **{k: v for k, v in account.items()
                   if k not in ('username', 'password', 'enabled')}}
+
+        # 座位号(seats)查表转换为座位ID(seat_ids)，确定最终预约的座位
+        params['seat_ids'] = resolve_final_seats(account, defaults)
 
         print(f"\n{'='*40}")
         print(f"预约第 {i}/{len(accounts)} 个账号: {username}")

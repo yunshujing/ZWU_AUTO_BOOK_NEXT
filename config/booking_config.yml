@@ -15,10 +15,14 @@ begin: 12
 duration: 9
 
 # 指定座位ID列表，留空或设为 null 则随机选座
-# 查看座位ID: 打开 zwu_lib.xlsx
+# 查看座位ID: python seatmap.py <自习室编号> <座位号>，或打开 zwu_lib.xlsx
 seat_ids:
   - 12920
   - 12921
+
+# 指定座位号列表（选座页显示的编号，自动转换为座位ID），如 [113, 114]
+# 与 seat_ids 同时配置时以 seat_ids 为准
+seats: null
 
 # ============================================
 # 抢座策略

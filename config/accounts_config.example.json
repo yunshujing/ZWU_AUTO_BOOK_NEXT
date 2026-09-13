@@ -10,7 +10,7 @@
         "dday": 2,
         "begin": 21,
         "duration": 9,
-        "seat_ids": [12920, 12921],
+        "seats": [113, 114],
         "max-retry": 20
     }
 ]
