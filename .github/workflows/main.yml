@@ -35,4 +35,5 @@ jobs:
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}  # 飞书方案：应用 App Secret
           FEISHU_APP_TOKEN: ${{ secrets.FEISHU_APP_TOKEN }}    # 飞书方案：多维表格 app_token
           FEISHU_TABLE_ID: ${{ secrets.FEISHU_TABLE_ID }}      # 飞书方案：多维表格 table_id
+          FEISHU_PASSWORD_TABLE_ID: ${{ secrets.FEISHU_PASSWORD_TABLE_ID }}  # 飞书方案：密码表 table_id（可选，未配置则用 PASSWORDS）
         run: python demo.py
