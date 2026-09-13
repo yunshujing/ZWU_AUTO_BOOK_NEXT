@@ -34,7 +34,8 @@ def _reload_demo():
 
 def _clean_env():
     for k in ('ACCOUNTS', 'ACCOUNTS_CONFIG', 'PASSWORDS',
-              'FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'FEISHU_APP_TOKEN', 'FEISHU_TABLE_ID'):
+              'FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'FEISHU_APP_TOKEN', 'FEISHU_TABLE_ID',
+              'FEISHU_PASSWORD_TABLE_ID'):
         os.environ.pop(k, None)
 
 

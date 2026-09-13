@@ -75,7 +75,8 @@ def _ensure_no_local_file():
 
 def _clean_env():
     for k in ('ACCOUNTS', 'ACCOUNTS_CONFIG', 'PASSWORDS',
-              'FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'FEISHU_APP_TOKEN', 'FEISHU_TABLE_ID'):
+              'FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'FEISHU_APP_TOKEN', 'FEISHU_TABLE_ID',
+              'FEISHU_PASSWORD_TABLE_ID'):
         os.environ.pop(k, None)
 
 
@@ -527,6 +528,129 @@ def test_15_feishu_text_field_as_list():
     print("[PASS] feishu list-format text fields parsed correctly")
 
 
+def test_16_feishu_password_table_priority_and_fallback():
+    print("\n" + "=" * 60)
+    print("Test 16: feishu password table - table wins over PASSWORDS, secret as fallback")
+    print("=" * 60)
+    _ensure_no_local_file()
+    _clean_env()
+    os.environ['FEISHU_APP_ID'] = 'fake_app_id'
+    os.environ['FEISHU_APP_SECRET'] = 'fake_secret'
+    os.environ['FEISHU_APP_TOKEN'] = 'fake_token'
+    os.environ['FEISHU_TABLE_ID'] = 'tbl_accounts'
+    os.environ['FEISHU_PASSWORD_TABLE_ID'] = 'tbl_pwd'
+    os.environ['PASSWORDS'] = json.dumps({"userA": "secret_from_github", "userB": "pwdB"})
+
+    token_resp = {'code': 0, 'tenant_access_token': 't-fake', 'expire': 7200}
+    account_records = {
+        'code': 0,
+        'data': {
+            'items': [
+                {'record_id': 'r1', 'fields': {'username': 'userA'}},
+                {'record_id': 'r2', 'fields': {'username': 'userB'}},
+            ],
+            'has_more': False,
+        }
+    }
+    pwd_records = {
+        'code': 0,
+        'data': {
+            'items': [
+                {'record_id': 'p1', 'fields': {'username': 'userA', 'password': 'pwdA_from_feishu'}},
+            ],
+            'has_more': False,
+        }
+    }
+
+    def fake_post(url, **kwargs):
+        return _FakeResponse(token_resp)
+
+    def fake_get(url, **kwargs):
+        # 按_URL 中的 table_id 区分账号表和密码表
+        if 'tbl_pwd' in url:
+            return _FakeResponse(pwd_records)
+        return _FakeResponse(account_records)
+
+    demo = _reload_demo()
+    import types
+    fake_requests = types.SimpleNamespace()
+    fake_requests.post = fake_post
+    fake_requests.get = fake_get
+    demo.requests = fake_requests
+
+    accounts = demo.load_accounts()
+    assert len(accounts) == 2, "expected 2 accounts, got %d" % len(accounts)
+    by_user = {a['username']: a['password'] for a in accounts}
+    assert by_user['userA'] == 'pwdA_from_feishu', "password table should win, got %s" % by_user['userA']
+    assert by_user['userB'] == 'pwdB', "user missing from table should fall back to PASSWORDS"
+    print("[PASS] password table takes priority, PASSWORDS covers users missing from table")
+
+
+def test_17_feishu_password_table_list_format_without_passwords_secret():
+    print("\n" + "=" * 60)
+    print("Test 17: feishu password table - list-format fields, PASSWORDS secret absent")
+    print("=" * 60)
+    _ensure_no_local_file()
+    _clean_env()
+    os.environ['FEISHU_APP_ID'] = 'fake_app_id'
+    os.environ['FEISHU_APP_SECRET'] = 'fake_secret'
+    os.environ['FEISHU_APP_TOKEN'] = 'fake_token'
+    os.environ['FEISHU_TABLE_ID'] = 'tbl_accounts'
+    os.environ['FEISHU_PASSWORD_TABLE_ID'] = 'tbl_pwd'
+    # 故意不设置 PASSWORDS：只要密码表覆盖全部账号就不需要 Secret
+
+    token_resp = {'code': 0, 'tenant_access_token': 't-fake', 'expire': 7200}
+    account_records = {
+        'code': 0,
+        'data': {
+            'items': [
+                {'record_id': 'r1', 'fields': {'username': 'userC'}},
+                {'record_id': 'r2', 'fields': {'username': 'userD'}},
+            ],
+            'has_more': False,
+        }
+    }
+    # 密码表文本字段用 [{"text": ...}] 列表格式（飞书有时返回这种结构）
+    pwd_records = {
+        'code': 0,
+        'data': {
+            'items': [
+                {'record_id': 'p1', 'fields': {
+                    'username': [{'text': 'userC'}],
+                    'password': [{'text': 'pwdC'}],
+                }},
+            ],
+            'has_more': False,
+        }
+    }
+
+    def fake_post(url, **kwargs):
+        return _FakeResponse(token_resp)
+
+    def fake_get(url, **kwargs):
+        if 'tbl_pwd' in url:
+            return _FakeResponse(pwd_records)
+        return _FakeResponse(account_records)
+
+    demo = _reload_demo()
+    import types
+    fake_requests = types.SimpleNamespace()
+    fake_requests.post = fake_post
+    fake_requests.get = fake_get
+    demo.requests = fake_requests
+
+    import io
+    from contextlib import redirect_stdout
+    f = io.StringIO()
+    with redirect_stdout(f):
+        accounts = demo.load_accounts()
+    assert len(accounts) == 1, "userD has no password anywhere, only userC expected, got %d" % len(accounts)
+    assert accounts[0]['username'] == 'userC'
+    assert accounts[0]['password'] == 'pwdC'
+    assert "userD" in f.getvalue() and "未找到对应密码" in f.getvalue(), "userD skip should be logged"
+    print("[PASS] list-format password fields parsed, missing user skipped loudly, no PASSWORDS needed")
+
+
 if __name__ == '__main__':
     tests = [
         test_1_old_accounts_compat,
@@ -544,6 +668,8 @@ if __name__ == '__main__':
         test_13_feishu_records_error,
         test_14_feishu_password_missing,
         test_15_feishu_text_field_as_list,
+        test_16_feishu_password_table_priority_and_fallback,
+        test_17_feishu_password_table_list_format_without_passwords_secret,
     ]
     passed, failed = 0, 0
     for t in tests:

@@ -80,27 +80,50 @@ def load_accounts():
     return []
 
 
-def _merge_passwords(accounts_cfg):
-    """
-    解析 PASSWORDS Secret 并用 username 查密码，合并进账号清单。
-    被 _load_accounts_split 和 _load_accounts_from_feishu 共用。
+def _text_field_value(val):
+    """飞书文本字段可能是字符串或 [{"text": "..."}] 列表，统一转成字符串"""
+    if isinstance(val, list):
+        return ''.join(item.get('text', '') for item in val if isinstance(item, dict))
+    return str(val) if val is not None else ''
 
-    参数: accounts_cfg — 不含密码的账号列表，每个元素必须含 username
-    返回: 含密码的完整账号列表
+
+def _parse_passwords_secret():
+    """
+    解析 PASSWORDS Secret（{学号: 密码} JSON）。
+    未设置或解析失败返回 {}（失败时打印错误）。
     """
     passwords_str = os.environ.get('PASSWORDS', '')
     if not passwords_str:
-        print("错误: 未设置 PASSWORDS Secret。"
-              "配置分层和飞书表格方式都需要配置 PASSWORDS（{学号: 密码} JSON）。")
-        return []
+        return {}
     try:
         passwords = json.loads(passwords_str)
     except json.JSONDecodeError as e:
         print(f"错误: PASSWORDS JSON 解析失败: {e}")
-        return []
+        return {}
     if not isinstance(passwords, dict):
         print("错误: PASSWORDS 必须是 JSON 对象 {学号: 密码}")
-        return []
+        return {}
+    return passwords
+
+
+def _merge_passwords(accounts_cfg, passwords=None, source='PASSWORDS Secret'):
+    """
+    用 username 查密码映射，合并进账号清单。
+    被 _load_accounts_split 和 _load_accounts_from_feishu 共用。
+
+    参数:
+        accounts_cfg: 不含密码的账号列表，每个元素必须含 username
+        passwords: {username: password} 映射；None 时从 PASSWORDS Secret 解析
+        source: 密码来源描述（用于日志）
+    返回: 含密码的完整账号列表
+    """
+    if passwords is None:
+        passwords = _parse_passwords_secret()
+        if not passwords:
+            print("错误: 未设置 PASSWORDS Secret。"
+                  "配置分层方式需要配置 PASSWORDS（{学号: 密码} JSON）；"
+                  "飞书表格方式也可改用密码表（配置 FEISHU_PASSWORD_TABLE_ID）。")
+            return []
 
     merged = []
     for acc in accounts_cfg:
@@ -111,7 +134,7 @@ def _merge_passwords(accounts_cfg):
 
         password = passwords.get(username, '')
         if not password:
-            print(f"跳过: 账号 {username} 在 PASSWORDS 中未找到对应密码")
+            print(f"跳过: 账号 {username} 在 {source} 中未找到对应密码")
             continue
 
         merged_acc = dict(acc)
@@ -156,12 +179,80 @@ def _parse_int_list_field(raw):
     return [int(s.strip()) for s in text.split(',') if s.strip()]
 
 
+def _feishu_get_records(headers, app_token, table_id, label='数据表'):
+    """
+    分页读取一张数据表的全部记录，返回记录列表；失败打印错误并返回 None
+    """
+    base_url = f'https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records'
+    all_records = []
+    page_token = ''
+
+    while True:
+        params = {'page_size': 500}
+        if page_token:
+            params['page_token'] = page_token
+        try:
+            resp = requests.get(base_url, headers=headers, params=params, timeout=30)
+            data = resp.json()
+        except Exception as e:
+            print(f"错误: 读取飞书{label}失败: {e.__class__.__name__}: {e}")
+            return None
+
+        if data.get('code') != 0:
+            print(f"错误: 读取飞书{label}失败: {data.get('msg', '未知错误')}")
+            print("提示: 请检查多维表格是否已给应用授权(可查看权限)，以及 app_token/table_id 是否正确。")
+            return None
+
+        items = data.get('data', {}).get('items', [])
+        all_records.extend(items)
+
+        if not data.get('data', {}).get('has_more'):
+            break
+        page_token = data.get('data', {}).get('page_token', '')
+        if not page_token:
+            break
+
+    return all_records
+
+
+def _load_feishu_table_passwords(token, app_token):
+    """
+    读取飞书密码表（可选，配置 FEISHU_PASSWORD_TABLE_ID 后启用），
+    返回 {username: password}；未配置或读取失败返回 {}。
+    密码表列结构: username（文本）、password（文本），每行一个账号。
+    """
+    pwd_table_id = os.environ.get('FEISHU_PASSWORD_TABLE_ID', '')
+    if not pwd_table_id:
+        return {}
+
+    print("飞书: 正在读取密码表...")
+    headers = {'Authorization': f'Bearer {token}'}
+    records = _feishu_get_records(headers, app_token, pwd_table_id, '密码表')
+    if records is None:
+        print("警告: 密码表读取失败，将回退使用 PASSWORDS Secret")
+        return {}
+
+    passwords = {}
+    for record in records:
+        fields = record.get('fields', {})
+        username = _text_field_value(fields.get('username')).strip()
+        password = _text_field_value(fields.get('password')).strip()
+        if username and password:
+            passwords[username] = password
+    print(f"飞书: 密码表读取到 {len(passwords)} 条密码")
+    if not passwords:
+        print("警告: 密码表中没有有效记录（需要 username 和 password 两列文本字段）")
+    return passwords
+
+
 def _load_accounts_from_feishu():
     """
-    从飞书多维表格读取账号配置，从 PASSWORDS (Secret) 查密码。
+    从飞书多维表格读取账号配置，密码从飞书密码表读取（可选，
+    FEISHU_PASSWORD_TABLE_ID），密码表中没有的账号回退到 PASSWORDS Secret。
     返回合并后的账号列表（每个账号含 username + password + 覆盖字段）。
 
     需要 4 个环境变量: FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_APP_TOKEN, FEISHU_TABLE_ID
+    可选环境变量: FEISHU_PASSWORD_TABLE_ID（密码表 table_id，需与账号表同一个多维表格）
     注意: enabled 停用检查由主循环统一处理，此处不做。
     """
     app_id = os.environ.get('FEISHU_APP_ID', '')
@@ -195,37 +286,12 @@ def _load_accounts_from_feishu():
         return []
     token = token_data['tenant_access_token']
 
-    # 第二步: 分页读取多维表格记录
+    # 第二步: 分页读取账号配置表记录
     print("飞书: 正在读取多维表格记录...")
-    base_url = f'https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records'
     headers = {'Authorization': f'Bearer {token}'}
-    all_records = []
-    page_token = ''
-
-    while True:
-        params = {'page_size': 500}
-        if page_token:
-            params['page_token'] = page_token
-        try:
-            resp = requests.get(base_url, headers=headers, params=params, timeout=30)
-            data = resp.json()
-        except Exception as e:
-            print(f"错误: 读取飞书表格失败: {e.__class__.__name__}: {e}")
-            return []
-
-        if data.get('code') != 0:
-            print(f"错误: 读取飞书表格失败: {data.get('msg', '未知错误')}")
-            print("提示: 请检查多维表格是否已给应用授权(可查看权限)，以及 app_token/table_id 是否正确。")
-            return []
-
-        items = data.get('data', {}).get('items', [])
-        all_records.extend(items)
-
-        if not data.get('data', {}).get('has_more'):
-            break
-        page_token = data.get('data', {}).get('page_token', '')
-        if not page_token:
-            break
+    all_records = _feishu_get_records(headers, app_token, table_id, '账号配置表')
+    if all_records is None:
+        return []
 
     print(f"飞书: 共读取到 {len(all_records)} 条记录")
 
@@ -233,16 +299,11 @@ def _load_accounts_from_feishu():
     accounts_cfg = []
     for record in all_records:
         fields = record.get('fields', {})
-        username = fields.get('username', '')
-        if not username:
-            continue
-        # 飞书文本字段可能返回字符串或包含 text 字段的列表
-        if isinstance(username, list):
-            username = ''.join(item.get('text', '') for item in username if isinstance(item, dict))
+        username = _text_field_value(fields.get('username')).strip()
         if not username:
             continue
 
-        acc = {'username': str(username).strip()}
+        acc = {'username': username}
 
         # enabled: 复选框字段返回 bool
         if 'enabled' in fields:
@@ -276,8 +337,14 @@ def _load_accounts_from_feishu():
         print("警告: 飞书表格中没有有效账号记录")
         return []
 
-    # 第四步: 合并密码
-    return _merge_passwords(accounts_cfg)
+    # 第四步: 合并密码（密码表优先，PASSWORDS Secret 兜底）
+    passwords = _parse_passwords_secret()
+    table_passwords = _load_feishu_table_passwords(token, app_token)
+    if table_passwords:
+        passwords = {**passwords, **table_passwords}
+    source = ('PASSWORDS Secret 或飞书密码表'
+              if os.environ.get('FEISHU_PASSWORD_TABLE_ID') else 'PASSWORDS Secret')
+    return _merge_passwords(accounts_cfg, passwords, source)
 
 
 def _seats_to_ids(account, defaults, seats):
