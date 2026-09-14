@@ -879,6 +879,7 @@ def test_22_two_phase_login_before_booking():
     logins = [e for e in events if e[0] == 'login']
     books = [e for e in events if e[0] == 'book']
     assert len(logins) == 6, "expected 6 logins, got %d" % len(logins)
+    # 本轮打桩全员第一轮即成功 -> 不会进入补抢轮，正好每人 1 次
     assert len(books) == 6, "expected 6 bookings, got %d" % len(books)
 
     # 核心保证：所有登录都排在第一个抢座之前 —— 登录不再占用抢座窗口
@@ -1224,6 +1225,108 @@ def test_26_login_failure_is_specific():
     print("[PASS] each failure mode reports a distinct, actionable reason")
 
 
+def test_27_sweep_all_accounts_before_retry():
+    """
+    核心保证：所有账号先各出手【一次】，才轮到失败账号补抢。
+
+    这条是防回归的关键 —— 没有它，第 1 个账号会用长时间重试（最坏 5 分钟）
+    把后面 13 个账号全堵在场外，等轮到它们时开抢早已结束。
+    """
+    print("\n" + "=" * 60)
+    print("Test 27: every account fires once before any account retries")
+    print("=" * 60)
+    _ensure_no_local_file()
+    _clean_env()
+    os.environ['ACCOUNTS_CONFIG'] = json.dumps(
+        [{"username": "u%d" % i} for i in range(1, 7)])
+    os.environ['PASSWORDS'] = json.dumps({"u%d" % i: "p" for i in range(1, 7)})
+    demo = _reload_demo()
+
+    calls = []        # [(username, max_retry), ...] 按真实出手顺序
+    notified = []     # 收到通知的账号
+    # u1~u2 第一轮即成功；u3~u6 需要第 3 次出手才成功
+    first_pass_ok = {'u1', 'u2'}
+
+    class FakeSession:
+        def __init__(self, username):
+            self.username = username
+
+        def book(self, *args, **kwargs):
+            calls.append((self.username, kwargs.get('max_retry')))
+            # 第一轮（max_retry=1）只有 first_pass_ok 能成功
+            if kwargs.get('max_retry') == 1:
+                if self.username in first_pass_ok:
+                    return 'ok', 'mock success', 12920
+                return 'fail', '座位已被占用', None
+            # 补抢轮：除了 u3 永远抢不到，其余成功
+            if self.username == 'u3':
+                return 'fail', '座位已被占用', None
+            return 'ok', 'mock success', 12920
+
+    def fake_open_session(username, password, room_id, **kwargs):
+        return FakeSession(username), None
+
+    demo.open_session = fake_open_session
+    demo.notify = demo.notify_fail = lambda *a, **k: None
+    _orig_notify_result = demo.notify_result
+
+    def spy_notify(result):
+        notified.append(result['username'])
+        _orig_notify_result(result)
+
+    demo.notify_result = spy_notify
+
+    f = io.StringIO()
+    with redirect_stdout(f):
+        accounts = demo.load_accounts()
+        defaults = demo.load_booking_config()
+        defaults['concurrency-jitter'] = 0
+        defaults['max-retry'] = 32
+        demo.run_all(accounts, defaults, concurrency=1)
+    output = f.getvalue()
+
+    # ---- 断言 1：第一轮必须覆盖全部 6 个账号，且各只出手 1 次 ----
+    sweep = [c for c in calls if c[1] == 1]
+    sweep_users = [c[0] for c in sweep]
+    assert len(sweep) == 6, \
+        "first round must include all 6 accounts, got %s" % sweep_users
+    assert len(set(sweep_users)) == 6, \
+        "each account must fire exactly once in the first round, got %s" % sweep_users
+
+    # ---- 断言 2（核心）：任何补抢调用都不能早于第一轮的最后一个出手 ----
+    first_retry_idx = next(
+        (i for i, c in enumerate(calls) if c[1] != 1), None)
+    last_sweep_idx = max(i for i, c in enumerate(calls) if c[1] == 1)
+    assert first_retry_idx is None or first_retry_idx > last_sweep_idx, \
+        ("retry must not start before every account has fired once; "
+         "order=%s" % calls)
+
+    # ---- 断言 3：只有第一轮失败的账号进入补抢 ----
+    retried = [c[0] for c in calls if c[1] != 1]
+    assert set(retried) == {'u3', 'u4', 'u5', 'u6'}, \
+        "only sweep failures may be retried, got %s" % retried
+    assert 'u1' not in retried and 'u2' not in retried, \
+        "accounts that succeeded in the sweep must not be retried, got %s" % retried
+
+    # ---- 断言 4：补抢用完整重试节奏，而不是又一次单发 ----
+    retry_budgets = {c[1] for c in calls if c[1] != 1}
+    assert retry_budgets == {32}, \
+        "retry round must use the configured max-retry, got %s" % retry_budgets
+
+    # ---- 断言 5：第一轮不逐个发通知（多数会失败，属于噪音） ----
+    sweep_notified = set(notified) - set(retried)
+    assert 'u1' in notified and 'u2' in notified, \
+        "accounts that succeeded must be notified, got %s" % notified
+    assert 'u3' in notified, \
+        "accounts that ultimately failed must be notified, got %s" % notified
+    assert len(notified) == len(set(notified)), \
+        "no account may be notified twice, got %s" % notified
+
+    assert '[第一轮]' in output and '[第二轮]' in output, \
+        "log must label the two rounds"
+    print("[PASS] order=%s" % [(c[0], c[1]) for c in calls])
+
+
 if __name__ == '__main__':
     tests = [
         test_1_old_accounts_compat,
@@ -1252,6 +1355,7 @@ if __name__ == '__main__':
         test_24_jitter_applies_only_when_concurrent,
         test_25_login_retry_rebuilds_browser,
         test_26_login_failure_is_specific,
+        test_27_sweep_all_accounts_before_retry,
     ]
     passed, failed = 0, 0
     try:

@@ -571,12 +571,18 @@ def book_session(session, params, max_retry=None):
     )
 
 
-def book_one(result, max_retry=None, jitter=0.0):
+def book_one(result, max_retry=None, jitter=0.0, notify=True):
     """
     阶段二单账号：抢座 → 立即通知。就地更新 result 并返回它。
 
     jitter（秒）> 0 时先随机等待 0~jitter 再出手。并发只让 3 个请求重叠，
     错开抖动则避免它们落在同一瞬间 —— 时间上散开比"完全同时"更像真人行为。
+
+    notify=False 时不发通知，供「第一轮全员出手」使用 —— 那一轮多数账号会失败，
+    此时通知属于噪音；由调用方在账号确定放弃时统一通知。
+
+    max_retry=1 让账号只出手一次：这是第一轮全员出手所用的模式，
+    保证后面排队的账号不会被前面失败账号的长时间重试堵住。
     """
     username = result['username']
 
@@ -594,8 +600,16 @@ def book_one(result, max_retry=None, jitter=0.0):
 
     result['stat'], result['msg'], result['seatid'] = stat, msg, seatid
     print(f"结果 {username}: {stat} - {msg}")
-    notify_result(result)
+    if notify:
+        notify_result(result)
     return result
+
+
+def _succeeded(result):
+    """账号是否已「尘埃落定」——抢到座位，或本就是重复预约（说明已有座）"""
+    if result['stat'] == 'ok':
+        return True
+    return '请勿重复预约' in (result.get('msg') or '')
 
 
 def process_account(index, total, account, defaults, max_retry=None):
@@ -622,9 +636,18 @@ def run_all(accounts, defaults, concurrency=1):
     两阶段调度：
 
       阶段一 逐个账号登录并产出轻量会话（慢活，浏览器用完立即关闭）
-      阶段二 用会话抢座（只发 HTTP 请求），按 concurrency 分批并发
+      阶段二 用会话抢座，分「两轮」：
 
-    如此「登录」不占用抢座窗口；并发只发生在最轻的抢座请求上。
+        第一轮：所有账号各出手【一次】（max_retry=1），谁都不许多试。
+                目的是让每个账号都在开抢瞬间附近摸到牌，不让排在前面的
+                账号用长时间重试把后面的账号堵在场外。
+                本轮「失败」不逐个发通知（多数会失败，属于噪音），但抢到的
+                账号立即通知 —— 否则要等到补抢轮跑完才收到消息。
+
+        第二轮：只给第一轮没抢到的账号补抢，此时才用完整的
+                「探路 → 猛攻」节奏（按 concurrency 分批并发）。
+
+    如此「登录」不占用抢座窗口，且「所有账号先各出手一次」得以保证。
     DRY RUN 下只做阶段一，且不发送任何通知。
     """
     total = len(accounts)
@@ -653,12 +676,35 @@ def run_all(accounts, defaults, concurrency=1):
     suffix = f"，随机错开 0~{jitter:g}s" if jitter > 0 else ""
     print(f"\n登录完成：{len(ready)}/{total} 个账号拿到会话，"
           f"开始抢座（并发 {workers}{suffix}）")
+
     t_start = time.monotonic()
-    try:
+
+    # ---- 第一轮：全员各出手一次，抢开抢瞬间 ----
+    print(f"\n{'='*40}")
+    print(f"[第一轮] {len(ready)} 个账号各出手一次（不重试，确保全员都摸到牌）")
+    print(f"{'='*40}")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(lambda r: book_one(r, max_retry=1, jitter=jitter, notify=False),
+                      ready))
+    done = [r for r in ready if _succeeded(r)]
+    pending = [r for r in ready if not _succeeded(r)]
+    print(f"[第一轮] 结束：{len(done)} 成功 / {len(pending)} 待补抢")
+
+    # 第一轮就抢到的账号结论已定，立刻通知（不压到第二轮，否则要等到补抢跑完）
+    for r in done:
+        notify_result(r)
+
+    # ---- 第二轮：只给失败的账号补抢，用完整重试节奏 ----
+    if pending:
+        print(f"\n{'='*40}")
+        print(f"[第二轮] {len(pending)} 个账号补抢（探路 → 猛攻）")
+        print(f"{'='*40}")
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(lambda r: book_one(r, jitter=jitter), ready))
-    finally:
-        print(f"[timer] 抢座阶段结束，耗时 {time.monotonic() - t_start:.2f}s")
+            list(pool.map(lambda r: book_one(r, jitter=jitter), pending))
+    else:
+        print("[第二轮] 无需补抢，全部账号已在第一轮成功")
+
+    print(f"[timer] 抢座阶段结束，耗时 {time.monotonic() - t_start:.2f}s")
     return results
 
 
