@@ -26,6 +26,12 @@ DEFAULT_RUSH_INTERVAL = 3    # 猛攻间隔（秒）
 DEFAULT_RUSH_DURATION = 60   # 猛攻持续时长（秒），用于换算猛攻次数
 CANDIDATE_SEAT_INTERVAL = 2  # 同一账号尝试下一个候选座位的间隔（秒）
 
+# 登录重试：站点偶发慢响应会让 WebDriverWait 超时（实测约 10% 概率），
+# 但这类失败重跑一次通常就好，不是账号或密码问题。每次重试都重建浏览器实例。
+DEFAULT_LOGIN_RETRY = 2      # 登录失败后的额外重试次数（总尝试 = 1 + 该值）
+DEFAULT_LOGIN_RETRY_WAIT = 3 # 两次登录尝试之间的等待（秒）
+LOGIN_PAGE_TIMEOUT = 15      # 登录页等待超时（秒），给慢网络留缓冲
+
 
 @contextmanager
 def _stage(stages, name):
@@ -37,10 +43,11 @@ def _stage(stages, name):
         stages.append((name, time.monotonic() - start))
 
 
-def _log_timer(username, stages, total):
+def _log_timer(username, stages, total, attempts=1):
     """打印分阶段耗时，用于定位瓶颈（优化效果的量化依据）"""
     detail = ' '.join(f"{name}={cost:.2f}s" for name, cost in stages)
-    print(f"[timer] user={username} {detail} 合计={total:.2f}s")
+    extra = f" 尝试次数={attempts}" if attempts > 1 else ''
+    print(f"[timer] user={username} {detail} 合计={total:.2f}s{extra}")
 
 # 自习室编号 -> 名称
 ROOM_NAMES = ['自习室112', '自习室113', '自习室114', '自习室212', '自习室213', '自习室214', '自习室312', '自习室313', '自习室314']
@@ -261,7 +268,7 @@ class SeatAutoBooker:
         else:
             service = Service(ChromeDriverManager().install())
             self.driver = webdriver.Chrome(service=service, options=chrome_options)
-        self.wait = WebDriverWait(self.driver, 10, 0.5)
+        self.wait = WebDriverWait(self.driver, LOGIN_PAGE_TIMEOUT, 0.5)
         self.cookie = None
 
         cfg = load_api_config()
@@ -340,37 +347,72 @@ class SeatAutoBooker:
         return 0
 
 
-def open_session(username, password, room_id):
+def open_session(username, password, room_id, login_retry=DEFAULT_LOGIN_RETRY,
+                 login_retry_wait=DEFAULT_LOGIN_RETRY_WAIT):
     """
     启动浏览器 → 登录 → 取 UID → 产出轻量会话，随后**立即关闭浏览器**。
 
     返回 (session, err_msg)：成功时 err_msg 为 None，登录失败时 session 为 None。
     构造阶段的异常（如浏览器起不来）向外抛出，由调用方统一转成可读文案并做逐账号隔离。
+
+    登录是这里最脆弱的一环：实测约 10% 概率因站点慢响应而超时，但重跑通常就能成功，
+    并非账号或密码问题（已用同一账号重跑验证）。因此登录/取UID 失败会在**全新浏览器实例**
+    上重试 login_retry 次；构造异常（浏览器起不来）不重试 —— 那通常是环境问题，重试只会更慢。
     """
     t_start = time.monotonic()
     stages = []
-    s = None
+    last_err = '登录失败'
 
+    for attempt in range(max(0, int(login_retry)) + 1):
+        s = None
+        try:
+            if attempt > 0:
+                print(f"登录重试 {attempt}/{login_retry}（上次失败原因: {last_err}）")
+                time.sleep(max(0.0, float(login_retry_wait)))
+
+            with _stage(stages, '启动'):
+                s = SeatAutoBooker(username, password, room_id, None)
+
+            with _stage(stages, '登录'):
+                if s.login() != 0:
+                    last_err = '登录失败'
+                    _close(s)
+                    continue
+
+            with _stage(stages, '取UID'):
+                if s.get_user_info() != 0:
+                    last_err = '获取用户信息失败'
+                    _close(s)
+                    continue
+
+            with _stage(stages, '转会话'):
+                session = s.to_session()
+            _close(s)
+            _log_timer(username, stages, time.monotonic() - t_start,
+                       attempts=attempt + 1)
+            return session, None
+
+        except Exception:
+            # 构造阶段异常（浏览器起不来等）：关闭已开实例后向上抛，不重试
+            _close(s)
+            _log_timer(username, stages, time.monotonic() - t_start,
+                       attempts=attempt + 1)
+            raise
+
+    # 所有尝试都失败
+    _log_timer(username, stages, time.monotonic() - t_start,
+               attempts=max(0, int(login_retry)) + 1)
+    return None, last_err or '登录失败'
+
+
+def _close(booker):
+    """安全关闭浏览器，收尾失败不应影响主流程结论"""
+    if booker is None:
+        return
     try:
-        with _stage(stages, '启动'):
-            s = SeatAutoBooker(username, password, room_id, None)
-
-        with _stage(stages, '登录'):
-            if s.login() != 0:
-                return None, '登录失败'
-
-        with _stage(stages, '取UID'):
-            if s.get_user_info() != 0:
-                return None, '获取用户信息失败'
-
-        with _stage(stages, '转会话'):
-            session = s.to_session()
-        return session, None
-    finally:
-        if s is not None:
-            with _stage(stages, '收尾'):
-                s.driver.quit()
-        _log_timer(username, stages, time.monotonic() - t_start)
+        booker.driver.quit()
+    except Exception:
+        pass
 
 
 def appoint_zwulib(username, password, room_id=2, dday=2, begin=12, duration=9,

@@ -226,7 +226,7 @@ def _run_main_loop_with_mock(demo, captured):
                              'seat_ids': kwargs.get('seat_ids')})
             return 'ok', 'mock success', 12920
 
-    def fake_open_session(username, password, room_id):
+    def fake_open_session(username, password, room_id, **kwargs):
         return FakeSession(username), None
 
     demo.open_session = fake_open_session

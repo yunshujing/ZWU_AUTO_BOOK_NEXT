@@ -32,6 +32,8 @@ DEFAULTS = {
     'retry-rush-duration': 60,    # 猛攻持续时长（秒）
     'concurrency': 1,             # 抢座阶段并发账号数（1 = 最保守；3 = 三个一批）
     'concurrency-jitter': 0.8,    # 并发时各账号出手的随机错开上限（秒），0 = 不错开
+    'login-retry': 2,             # 登录失败后的额外重试次数（总尝试 = 1 + 该值）
+    'login-retry-wait': 3,        # 两次登录尝试之间的等待（秒）
     'notification_type': 'none',
     'sckey': '',
     'smtp': {},
@@ -532,7 +534,10 @@ def prepare_account(index, total, account, defaults):
     result['params'] = params
 
     try:
-        session, err = open_session(username, password, params.get('room_id'))
+        session, err = open_session(
+            username, password, params.get('room_id'),
+            login_retry=params.get('login-retry', 2),
+            login_retry_wait=params.get('login-retry-wait', 3))
     except Exception as e:
         print(f"账号 {username} 执行异常: {e.__class__.__name__}: {e}")
         result['stat'], result['msg'] = 'fail', _friendly_error(e)

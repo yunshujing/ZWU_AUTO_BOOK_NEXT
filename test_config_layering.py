@@ -54,7 +54,7 @@ def _run_main_loop_ex(demo, fail_on=None, book_fail_on=None, notify=None, notify
                 return 'fail', '无可用座位', None
             return 'ok', 'mock success', 12920
 
-    def fake_open_session(username, password, room_id):
+    def fake_open_session(username, password, room_id, **kwargs):
         if fail_on and username == fail_on:
             raise RuntimeError("chrome failed to start")  # 模拟浏览器启动失败
         seen.append((username, password, room_id))
@@ -858,7 +858,7 @@ def test_22_two_phase_login_before_booking():
                 with lock:
                     live['n'] -= 1
 
-    def fake_open_session(username, password, room_id):
+    def fake_open_session(username, password, room_id, **kwargs):
         events.append(('login', username))
         time.sleep(0.02)
         return FakeSession(username), None
@@ -977,7 +977,7 @@ def test_24_jitter_applies_only_when_concurrent():
             def book(self, *a, **k):
                 return 'ok', 'mock success', 12920
 
-        demo.open_session = lambda u, p, r: (FakeSession(u), None)
+        demo.open_session = lambda u, p, r, **kw: (FakeSession(u), None)
         demo.notify = demo.notify_fail = lambda *a, **k: None
 
         f = io.StringIO()
@@ -1003,6 +1003,128 @@ def test_24_jitter_applies_only_when_concurrent():
     assert '[隔离]' not in out_zero, "jitter=0 must disable staggering"
     assert '随机错开' not in out_zero
     print("[PASS] jitter only when concurrent; serial and jitter=0 stay untouched")
+
+
+def test_25_login_retry_rebuilds_browser():
+    print("\n" + "=" * 60)
+    print("Test 25: login failure retries on a fresh browser; success aborts retries")
+    print("=" * 60)
+    import zwulib
+
+    # --- 场景 A：前两次登录失败，第三次成功 ---
+    log = {'built': 0, 'quit': 0, 'login': []}
+
+    class FlakyBooker:
+        def __init__(self, username, password, room_id, seat_ids):
+            self.driver = self
+            self.uid = 12345
+            log['built'] += 1
+            self.n = log['built']
+
+        def login(self):
+            log['login'].append(self.n)
+            return 0 if self.n >= 3 else -1   # 前两次失败
+
+        def get_user_info(self):
+            return 0
+
+        def to_session(self):
+            return zwulib.SeatSession('u', 'cookie', 1, 2)
+
+        def quit(self):
+            log['quit'] += 1
+
+    real = zwulib.SeatAutoBooker
+    zwulib.SeatAutoBooker = FlakyBooker
+    try:
+        f = io.StringIO()
+        with redirect_stdout(f):
+            session, err = zwulib.open_session('u', 'p', 2, login_retry=2,
+                                                login_retry_wait=0)
+    finally:
+        zwulib.SeatAutoBooker = real
+
+    assert session is not None, "第三次尝试应成功，实际 err=%s" % err
+    assert err is None
+    assert log['built'] == 3, \
+        "每次重试都应重建浏览器实例（共 3 次），实际 %d 次" % log['built']
+    assert log['quit'] == 3, \
+        "每个失败的实例都必须被关闭，实际 quit %d 次" % log['quit']
+    assert '登录重试' in f.getvalue(), "重试时应打印提示"
+    assert '尝试次数' in f.getvalue(), "多次尝试时 timer 应带尝试次数"
+
+    # --- 场景 B：第一次就成功，不应重试 ---
+    log2 = {'built': 0}
+
+    class OkBooker(FlakyBooker):
+        def __init__(self, username, password, room_id, seat_ids):
+            super().__init__(username, password, room_id, seat_ids)
+            log2['built'] += 1
+
+        def login(self):
+            return 0
+
+    zwulib.SeatAutoBooker = OkBooker
+    try:
+        with redirect_stdout(io.StringIO()):
+            session2, err2 = zwulib.open_session('u', 'p', 2, login_retry=2,
+                                                 login_retry_wait=0)
+    finally:
+        zwulib.SeatAutoBooker = real
+
+    assert session2 is not None and err2 is None
+    assert log2['built'] == 1, \
+        "登录成功就不该重试，实际构造了 %d 次" % log2['built']
+
+    # --- 场景 C：全部失败时返回最后一次的原因，且实例都被关闭 ---
+    log3 = {'built': 0, 'quit': 0}
+
+    class DeadBooker(FlakyBooker):
+        def __init__(self, username, password, room_id, seat_ids):
+            super().__init__(username, password, room_id, seat_ids)
+            log3['built'] += 1
+
+        def login(self):
+            return -1
+
+        def quit(self):
+            log3['quit'] += 1
+
+    zwulib.SeatAutoBooker = DeadBooker
+    try:
+        with redirect_stdout(io.StringIO()):
+            session3, err3 = zwulib.open_session('u', 'p', 2, login_retry=2,
+                                                 login_retry_wait=0)
+    finally:
+        zwulib.SeatAutoBooker = real
+
+    assert session3 is None
+    assert err3 == '登录失败', "全部失败应返回最后一次原因，实际 %s" % err3
+    assert log3['built'] == 3 and log3['quit'] == 3, \
+        "全部失败时也要清理干净，built=%d quit=%d" % (log3['built'], log3['quit'])
+
+    # --- 场景 D：构造异常（浏览器起不来）不重试，直接向上抛 ---
+    log4 = {'built': 0}
+
+    class BrokenBooker:
+        def __init__(self, username, password, room_id, seat_ids):
+            log4['built'] += 1
+            raise RuntimeError("chrome failed to start")
+
+    zwulib.SeatAutoBooker = BrokenBooker
+    raised = False
+    try:
+        with redirect_stdout(io.StringIO()):
+            zwulib.open_session('u', 'p', 2, login_retry=2, login_retry_wait=0)
+    except RuntimeError:
+        raised = True
+    finally:
+        zwulib.SeatAutoBooker = real
+
+    assert raised, "构造异常应向上抛出，由调用方处理"
+    assert log4['built'] == 1, \
+        "环境类异常不重试（重试只会更慢），实际尝试 %d 次" % log4['built']
+    print("[PASS] retries rebuild browser, close every instance, skip retry on env errors")
 
 
 if __name__ == '__main__':
@@ -1031,6 +1153,7 @@ if __name__ == '__main__':
         test_22_two_phase_login_before_booking,
         test_23_concurrent_sessions_never_share_cookies,
         test_24_jitter_applies_only_when_concurrent,
+        test_25_login_retry_rebuilds_browser,
     ]
     passed, failed = 0, 0
     try:
