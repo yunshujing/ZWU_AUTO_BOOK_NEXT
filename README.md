@@ -657,7 +657,7 @@ python update_driver.py
 ### 第 0 层：离线自测（不联网、不占座、不用账号）
 
 ```bash
-python test_config_layering.py   # 配置分层 + 两阶段调度 + DRY RUN + 异常隔离（22 项）
+python test_config_layering.py   # 配置分层 + 两阶段调度 + 并发隔离 + DRY RUN（24 项）
 python test_seatmap.py           # 座位号转换 + 座位信息缓存 + 通知文案（14 项）
 python test_retry_plan.py        # 抢座重试节奏（7 项）
 ```
@@ -709,7 +709,7 @@ ZWU_AUTO_BOOK_NEXT/
 ├── seatmap.py                       # 座位号→座位ID 映射转换 + 命令行查询工具
 ├── notice.py                        # 通知模块（Server酱 + 邮件）
 ├── update_driver.py                 # ChromeDriver 自动更新工具（本地用）
-├── test_config_layering.py          # 配置分层 + 两阶段调度 + DRY RUN + 异常隔离（22项场景）
+├── test_config_layering.py          # 配置分层 + 两阶段调度 + 并发隔离 + DRY RUN（24项场景）
 ├── test_seatmap.py                  # 座位号转换 + 座位缓存 + 通知文案测试（14项场景）
 ├── test_retry_plan.py               # 抢座重试节奏测试（7项场景）
 ├── _config.yml                      # API 配置

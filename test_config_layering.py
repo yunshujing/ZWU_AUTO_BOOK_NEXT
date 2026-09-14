@@ -870,6 +870,9 @@ def test_22_two_phase_login_before_booking():
     with redirect_stdout(f):
         accounts = demo.load_accounts()
         defaults = demo.load_booking_config()
+        # 关掉抖动：抖动的作用就是把请求错开，会与"必须重叠"的断言互相冲突。
+        # 抖动本身的行为由 Test 24 单独覆盖。
+        defaults['concurrency-jitter'] = 0
         demo.run_all(accounts, defaults, concurrency=3)
     output = f.getvalue()
 
@@ -954,6 +957,54 @@ def test_23_concurrent_sessions_never_share_cookies():
     print("[PASS] %d concurrent sessions: cookies/uids stayed paired, headers isolated" % N)
 
 
+def test_24_jitter_applies_only_when_concurrent():
+    print("\n" + "=" * 60)
+    print("Test 24: request jitter applies only when concurrency > 1 and jitter > 0")
+    print("=" * 60)
+    _ensure_no_local_file()
+    _clean_env()
+    os.environ['ACCOUNTS_CONFIG'] = json.dumps(
+        [{"username": "u%d" % i} for i in range(1, 5)])
+    os.environ['PASSWORDS'] = json.dumps({"u%d" % i: "p" for i in range(1, 5)})
+
+    def harness(concurrency, jitter):
+        demo = _reload_demo()
+
+        class FakeSession:
+            def __init__(self, username):
+                self.username = username
+
+            def book(self, *a, **k):
+                return 'ok', 'mock success', 12920
+
+        demo.open_session = lambda u, p, r: (FakeSession(u), None)
+        demo.notify = demo.notify_fail = lambda *a, **k: None
+
+        f = io.StringIO()
+        with redirect_stdout(f):
+            accounts = demo.load_accounts()
+            defaults = demo.load_booking_config()
+            defaults['concurrency-jitter'] = jitter
+            demo.run_all(accounts, defaults, concurrency=concurrency)
+        return f.getvalue()
+
+    # 串行：绝不抖动（避免白白增加耗时）
+    out_serial = harness(1, 0.8)
+    assert '[隔离]' not in out_serial, "serial mode must not stagger requests"
+    assert '随机错开' not in out_serial, "serial mode must not announce jitter"
+
+    # 并发 + 抖动 > 0：应出现错开日志
+    out_conc = harness(3, 0.5)
+    assert '[隔离]' in out_conc, "concurrent mode with jitter must stagger requests"
+    assert '随机错开 0~0.5s' in out_conc, "jitter amount should be reported: %s" % out_conc[-400:]
+
+    # 并发 + 抖动 = 0：显式关闭后不应错开
+    out_zero = harness(3, 0)
+    assert '[隔离]' not in out_zero, "jitter=0 must disable staggering"
+    assert '随机错开' not in out_zero
+    print("[PASS] jitter only when concurrent; serial and jitter=0 stay untouched")
+
+
 if __name__ == '__main__':
     tests = [
         test_1_old_accounts_compat,
@@ -979,6 +1030,7 @@ if __name__ == '__main__':
         test_21_appoint_dry_run_skips_booking,
         test_22_two_phase_login_before_booking,
         test_23_concurrent_sessions_never_share_cookies,
+        test_24_jitter_applies_only_when_concurrent,
     ]
     passed, failed = 0, 0
     try:
