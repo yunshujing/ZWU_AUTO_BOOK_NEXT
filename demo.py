@@ -30,7 +30,7 @@ DEFAULTS = {
     'retry-probe-count': 8,       # 探路次数上限
     'retry-rush-interval': 3,     # 猛攻间隔（秒）
     'retry-rush-duration': 60,    # 猛攻持续时长（秒）
-    'concurrency': 1,             # 抢座阶段并发账号数（1 = 最保守；3 = 三个一批）
+    'concurrency': 3,             # 抢座阶段并发账号数（1 = 最保守；3 = 三个一批）
     'concurrency-jitter': 0.8,    # 并发时各账号出手的随机错开上限（秒），0 = 不错开
     'notification_type': 'none',
     'sckey': '',
