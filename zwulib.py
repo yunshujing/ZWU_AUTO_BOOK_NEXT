@@ -248,6 +248,7 @@ class SeatAutoBooker:
         self.resp = None
         self.user_data = {}
         self._begin_hour = 12  # 初始化默认值
+        self.login_fail_detail = ''  # 登录失败的具体原因，供上层写进通知
 
         self.un = userID  # 学号
         print("使用用户：{}".format(self.un))
@@ -281,54 +282,90 @@ class SeatAutoBooker:
         """把登录后的状态转成轻量会话，之后即可关闭浏览器（抢座不再需要它）"""
         return SeatSession(self.un, self.cookie, self.user_data['uid'], self.room_id)
 
+    def _wait_for(self, by, value, desc, hint):
+        """
+        等待元素出现。超时时打印「哪一步 + 什么原因 + 怎么排查」，返回 None。
+
+        TimeoutException 原样抛出就会丢失「卡在第几步」这个信息 ——
+        页面没打开、前端改版导致选择器失效、服务器慢，三者现象都是「超时」，
+        但处理方式完全不同，所以必须分开报。
+        """
+        try:
+            return self.wait.until(EC.presence_of_element_located((by, value)))
+        except TimeoutException:
+            self.login_fail_detail = f"等待{desc}超时（{hint}）"
+            print(f"登录失败：等待{desc}超时，{hint}")
+            return None
+
     def login(self):
         """登录智数图平台"""
         pwd_path_selector = """//*[@id="react-root"]/div/div/div[1]/div[2]/div/div[1]/div[2]/div/div/div/div/div[1]/div[2]/div/div[3]/div/div[2]/input"""
         button_path_selector = """//*[@id="react-root"]/div/div/div[1]/div[2]/div/div[1]/div[2]/div/div/div/div/div[1]/div[3]"""
+        self.login_fail_detail = ''
 
+        # 步骤 1：打开首页。失败通常是网络不通或被拦截，与选择器无关。
         try:
             self.driver.get("https://zjwu.huitu.zhishulib.com/")
+        except TimeoutException:
+            self.login_fail_detail = '打开首页超时（网站无响应或网络不通）'
+            print(f"登录失败：{self.login_fail_detail}")
+            return -1
 
-            # 找到用户名输入框（wait.until 本身就在等页面就绪，无需额外固定等待）
-            self.wait.until(EC.presence_of_element_located((By.NAME, "login_name")))
-            self.driver.find_element(By.NAME, 'login_name').clear()
-            self.driver.find_element(By.NAME, 'login_name').send_keys(self.un)
+        # 步骤 2：等用户名输入框。失败通常是前端改版（选择器失效）。
+        elem = self._wait_for(By.NAME, "login_name",
+                              '用户名输入框', '页面可能未加载完或前端已改版')
+        if elem is None:
+            return -1
+        elem.clear()
+        elem.send_keys(self.un)
 
-            # 找到密码输入框
-            self.wait.until(EC.presence_of_element_located((By.XPATH, pwd_path_selector)))
-            self.driver.find_element(By.XPATH, pwd_path_selector).clear()
-            self.driver.find_element(By.XPATH, pwd_path_selector).send_keys(self.password)
+        # 步骤 3：等密码输入框
+        elem = self._wait_for(By.XPATH, pwd_path_selector,
+                              '密码输入框', '页面可能未加载完或前端已改版')
+        if elem is None:
+            return -1
+        elem.clear()
+        elem.send_keys(self.password)
 
-            # 找到登录按钮并点击
-            self.wait.until(EC.presence_of_element_located((By.XPATH, button_path_selector)))
-            self.driver.find_element(By.XPATH, button_path_selector).click()
+        # 步骤 4：等登录按钮并点击
+        elem = self._wait_for(By.XPATH, button_path_selector,
+                              '登录按钮', '页面可能未加载完或前端已改版')
+        if elem is None:
+            return -1
+        elem.click()
 
-            # 等跳出登录页，而不是固定睡 8 秒。
-            # 站点若改成不更换 URL 的路由方式，可设 LOGIN_WAIT_MODE=fixed 回退到旧的固定等待。
-            if os.environ.get('LOGIN_WAIT_MODE', 'url').lower() == 'fixed':
-                time.sleep(8)
-            else:
+        # 步骤 5：等跳出登录页，而不是固定睡 8 秒。
+        # 站点若改成不更换 URL 的路由方式，可设 LOGIN_WAIT_MODE=fixed 回退到旧的固定等待。
+        if os.environ.get('LOGIN_WAIT_MODE', 'url').lower() == 'fixed':
+            time.sleep(8)
+        else:
+            try:
                 self.wait.until(lambda d: 'login' not in (d.current_url or '').lower())
+            except TimeoutException:
+                # 按钮已点到，但没跳转：多半是账号密码错，或服务器响应慢
+                self.login_fail_detail = (
+                    f'点击登录后 {LOGIN_PAGE_TIMEOUT}s 仍未跳出登录页'
+                    '（账号密码错误，或服务器响应慢）')
+                print(f"登录失败：{self.login_fail_detail}")
+                return -1
 
-            # 提取cookies
+        # 步骤 6：取 Cookie 并确认已登录
+        try:
             cookie_list = self.driver.get_cookies()
             self.cookie = ";".join([item["name"] + "=" + item["value"] for item in cookie_list])
             self.headers['Cookie'] = self.cookie
 
-            # 验证登录是否成功
             current_url = self.driver.current_url
             if 'login' in current_url.lower():
-                print("登录可能失败，URL仍为登录页")
+                self.login_fail_detail = '页面 URL 仍停在登录页（账号密码可能错误）'
+                print(f"登录失败：{self.login_fail_detail}")
                 return -1
-
-        except TimeoutException:
-            print("登录超时，仍未跳出登录页")
-            return -1
         except Exception as e:
-            # 带上真实原因，否则一旦环境/站点变化，排查只能靠猜
             detail = ' '.join(str(e).split())[:200]
-            print(f"登录异常（{e.__class__.__name__}）: {detail}")
+            self.login_fail_detail = f'取登录凭证异常（{e.__class__.__name__}: {detail}）'
+            print(f"登录失败：{self.login_fail_detail}")
             return -1
+
         return 0
 
     def get_user_info(self):
@@ -375,13 +412,14 @@ def open_session(username, password, room_id, login_retry=DEFAULT_LOGIN_RETRY,
 
             with _stage(stages, '登录'):
                 if s.login() != 0:
-                    last_err = '登录失败'
+                    # 带上细分原因（哪一步超时）；用 getattr 兜底，避免替身/子类未设该属性时报错
+                    last_err = getattr(s, 'login_fail_detail', '') or '登录失败'
                     _close(s)
                     continue
 
             with _stage(stages, '取UID'):
                 if s.get_user_info() != 0:
-                    last_err = '获取用户信息失败'
+                    last_err = '获取用户信息失败（登录凭证可能无效）'
                     _close(s)
                     continue
 

@@ -1018,12 +1018,16 @@ def test_25_login_retry_rebuilds_browser():
         def __init__(self, username, password, room_id, seat_ids):
             self.driver = self
             self.uid = 12345
+            self.login_fail_detail = ''
             log['built'] += 1
             self.n = log['built']
 
         def login(self):
             log['login'].append(self.n)
-            return 0 if self.n >= 3 else -1   # 前两次失败
+            if self.n < 3:                     # 前两次失败
+                self.login_fail_detail = '等待密码输入框超时（页面可能未加载完或前端已改版）'
+                return -1
+            return 0
 
         def get_user_info(self):
             return 0
@@ -1052,6 +1056,8 @@ def test_25_login_retry_rebuilds_browser():
         "每个失败的实例都必须被关闭，实际 quit %d 次" % log['quit']
     assert '登录重试' in f.getvalue(), "重试时应打印提示"
     assert '尝试次数' in f.getvalue(), "多次尝试时 timer 应带尝试次数"
+    assert '等待密码输入框超时' in f.getvalue(), \
+        "重试提示里应带上一次失败的具体原因，而不是笼统的「登录失败」"
 
     # --- 场景 B：第一次就成功，不应重试 ---
     log2 = {'built': 0}
@@ -1085,6 +1091,7 @@ def test_25_login_retry_rebuilds_browser():
             log3['built'] += 1
 
         def login(self):
+            self.login_fail_detail = '打开首页超时（网站无响应或网络不通）'
             return -1
 
         def quit(self):
@@ -1099,7 +1106,8 @@ def test_25_login_retry_rebuilds_browser():
         zwulib.SeatAutoBooker = real
 
     assert session3 is None
-    assert err3 == '登录失败', "全部失败应返回最后一次原因，实际 %s" % err3
+    assert err3 == '打开首页超时（网站无响应或网络不通）', \
+        "全部失败应返回最后一次的细分原因，实际 %s" % err3
     assert log3['built'] == 3 and log3['quit'] == 3, \
         "全部失败时也要清理干净，built=%d quit=%d" % (log3['built'], log3['quit'])
 
@@ -1125,6 +1133,95 @@ def test_25_login_retry_rebuilds_browser():
     assert log4['built'] == 1, \
         "环境类异常不重试（重试只会更慢），实际尝试 %d 次" % log4['built']
     print("[PASS] retries rebuild browser, close every instance, skip retry on env errors")
+
+
+def test_26_login_failure_is_specific():
+    print("\n" + "=" * 60)
+    print("Test 26: login timeout reports WHICH step failed, not a vague message")
+    print("=" * 60)
+    import zwulib
+    from selenium.common.exceptions import TimeoutException
+
+    # 用一个假的 driver + 假 wait 驱动真实 login()，验证每一步超时的报错各不相同。
+    # 关键：三种「超时」处理方式天差地别（网站挂了 vs 前端改版 vs 密码错），
+    # 笼统报「登录超时」等于把排查成本转嫁给用户。
+    class FakeWait:
+        def __init__(self, fail_at, driver):
+            self.fail_at = fail_at   # 第几次 wait 调用时抛超时
+            self.driver = driver
+            self.n = 0
+
+        def until(self, cond):
+            self.n += 1
+            if self.n == self.fail_at:
+                raise TimeoutException('boom')
+            return FakeElement()
+
+    class FakeElement:
+        def clear(self): pass
+        def send_keys(self, s): pass
+        def click(self): pass
+
+    class FakeDriver:
+        def __init__(self, fail_get=False, final_url='https://x/home'):
+            self.fail_get = fail_get
+            self.final_url = final_url
+            self.current_url = 'https://x/login'
+
+        def get(self, url):
+            if self.fail_get:
+                raise TimeoutException('cannot load')
+            self.current_url = 'https://x/login'
+
+        def find_element(self, *a, **k):
+            return FakeElement()
+
+        def get_cookies(self):
+            return [{'name': 'sid', 'value': 'abc'}]
+
+    def make_booker(fail_get=False, fail_at=99, final_url='https://x/home'):
+        b = zwulib.SeatAutoBooker.__new__(zwulib.SeatAutoBooker)
+        b.un, b.password = 'u', 'p'
+        b.cookie, b.headers, b.login_fail_detail = None, {}, ''
+        b.driver = FakeDriver(fail_get=fail_get, final_url=final_url)
+        b.wait = FakeWait(fail_at, b.driver)
+        return b
+
+    cases = [
+        # (说明, 构造参数, 报错里必须出现的关键词)
+        ('首页打不开', dict(fail_get=True), '打开首页超时'),
+        ('用户框没出现', dict(fail_at=1), '用户名输入框'),
+        ('密码框没出现', dict(fail_at=2), '密码输入框'),
+        ('登录按钮没出现', dict(fail_at=3), '登录按钮'),
+        ('点了登录但没跳转', dict(fail_at=4), '仍未跳出登录页'),
+    ]
+
+    seen = {}
+    for desc, kwargs, keyword in cases:
+        b = make_booker(**kwargs)
+        f = io.StringIO()
+        with redirect_stdout(f):
+            rc = b.login()
+        assert rc == -1, "%s 应判定登录失败" % desc
+        assert keyword in b.login_fail_detail, \
+            "%s 的报错应包含「%s」，实际「%s」" % (desc, keyword, b.login_fail_detail)
+        assert keyword in f.getvalue(), "%s 应把原因打印出来" % desc
+        seen[desc] = b.login_fail_detail
+
+    # 五种的报错必须互不相同 —— 否则细分就失去意义
+    assert len(set(seen.values())) == len(cases), \
+        "五种失败的报错应各不相同，实际 %s" % seen
+
+    # 密码错场景：所有元素都在、点击成功，但 URL 停在登录页
+    b = make_booker(fail_at=99)
+    b.driver.final_url = 'https://x/login'
+    b.driver.current_url = 'https://x/login'
+    with redirect_stdout(io.StringIO()):
+        rc = b.login()
+    assert rc == -1 and '仍停在登录页' in b.login_fail_detail, \
+        "URL 停在登录页应提示账号密码可能错误，实际「%s」" % b.login_fail_detail
+
+    print("[PASS] each failure mode reports a distinct, actionable reason")
 
 
 if __name__ == '__main__':
@@ -1154,6 +1251,7 @@ if __name__ == '__main__':
         test_23_concurrent_sessions_never_share_cookies,
         test_24_jitter_applies_only_when_concurrent,
         test_25_login_retry_rebuilds_browser,
+        test_26_login_failure_is_specific,
     ]
     passed, failed = 0, 0
     try:
