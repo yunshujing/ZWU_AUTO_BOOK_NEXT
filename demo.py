@@ -25,9 +25,9 @@ DEFAULTS = {
     'duration': 9,
     'seat_ids': [12920, 12921],
     'cron-delta-minutes': 5,      # 已废弃，保留兼容
-    'max-retry': 32,
+    'max-retry': 3,               # 补抢轮出手次数（第一轮固定各 1 次）
     'retry-probe-interval': 10,   # 探路间隔（秒）
-    'retry-probe-count': 30,      # 探路次数上限（10s × 30 = 5 分钟探路窗口）
+    'retry-probe-count': 30,      # 探路次数上限（第一轮用；补抢轮跳过探路）
     'retry-rush-interval': 3,     # 猛攻间隔（秒）
     'retry-rush-duration': 60,    # 猛攻持续时长（秒）
     'concurrency': 1,             # 抢座阶段并发账号数（1 = 最保守；3 = 三个一批）
@@ -554,24 +554,28 @@ def prepare_account(index, total, account, defaults):
     return result
 
 
-def book_session(session, params, max_retry=None):
+def book_session(session, params, max_retry=None, probe_count=None):
     """
     用轻量会话抢座（只发 HTTP 请求，不需要浏览器）。
 
     独立成函数是为了让测试能注入替身，而不必真的发请求。
+
+    probe_count 可覆盖配置里的探路次数：补抢轮传 0 表示跳过探路、直接猛攻
+    （见 book_one 的说明）。
     """
     return session.book(
         params.get('dday'), params.get('begin'), params.get('duration'),
         seat_ids=params.get('seat_ids'),
-        max_retry=(params.get('max-retry', 32) if max_retry is None else max_retry),
+        max_retry=(params.get('max-retry', 3) if max_retry is None else max_retry),
         probe_interval=params.get('retry-probe-interval', 10),
-        probe_count=params.get('retry-probe-count', 30),
+        probe_count=(params.get('retry-probe-count', 30)
+                     if probe_count is None else probe_count),
         rush_interval=params.get('retry-rush-interval', 3),
         rush_duration=params.get('retry-rush-duration', 60),
     )
 
 
-def book_one(result, max_retry=None, jitter=0.0, notify=True):
+def book_one(result, max_retry=None, jitter=0.0, notify=True, probe_count=None):
     """
     阶段二单账号：抢座 → 立即通知。就地更新 result 并返回它。
 
@@ -583,6 +587,9 @@ def book_one(result, max_retry=None, jitter=0.0, notify=True):
 
     max_retry=1 让账号只出手一次：这是第一轮全员出手所用的模式，
     保证后面排队的账号不会被前面失败账号的长时间重试堵住。
+
+    probe_count=0 让本次调用跳过「探路」直接进入「猛攻」。补抢轮用这个 ——
+    补抢时系统必然已经开放，再"温和试探"只是白白把有限的次数耗在等待上。
     """
     username = result['username']
 
@@ -592,7 +599,8 @@ def book_one(result, max_retry=None, jitter=0.0, notify=True):
         time.sleep(delay)
 
     try:
-        stat, msg, seatid = book_session(result['session'], result['params'], max_retry)
+        stat, msg, seatid = book_session(result['session'], result['params'],
+                                         max_retry, probe_count)
     except Exception as e:
         # 单账号异常只影响它自己，其他账号照常处理
         print(f"账号 {username} 抢座异常: {e.__class__.__name__}: {e}")
@@ -694,13 +702,16 @@ def run_all(accounts, defaults, concurrency=1):
     for r in done:
         notify_result(r)
 
-    # ---- 第二轮：只给失败的账号补抢，用完整重试节奏 ----
+    # ---- 第二轮：只给失败的账号补抢，跳过探路、直接猛攻 ----
+    # 补抢时系统必然已经开放（第一轮已经确认过），再"温和试探"只会把有限的
+    # 次数耗在等待上 —— 所以这里探路次数传 0，全部次数用于猛攻。
     if pending:
         print(f"\n{'='*40}")
-        print(f"[第二轮] {len(pending)} 个账号补抢（探路 → 猛攻）")
+        print(f"[第二轮] {len(pending)} 个账号补抢（直接猛攻，跳过探路）")
         print(f"{'='*40}")
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(lambda r: book_one(r, jitter=jitter), pending))
+            list(pool.map(lambda r: book_one(r, jitter=jitter, probe_count=0),
+                          pending))
     else:
         print("[第二轮] 无需补抢，全部账号已在第一轮成功")
 

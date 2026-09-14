@@ -1242,9 +1242,9 @@ def test_27_sweep_all_accounts_before_retry():
     os.environ['PASSWORDS'] = json.dumps({"u%d" % i: "p" for i in range(1, 7)})
     demo = _reload_demo()
 
-    calls = []        # [(username, max_retry), ...] 按真实出手顺序
+    calls = []        # [(username, max_retry, probe_count), ...] 按真实出手顺序
     notified = []     # 收到通知的账号
-    # u1~u2 第一轮即成功；u3~u6 需要第 3 次出手才成功
+    # u1~u2 第一轮即成功；u3~u6 需要补抢
     first_pass_ok = {'u1', 'u2'}
 
     class FakeSession:
@@ -1252,7 +1252,8 @@ def test_27_sweep_all_accounts_before_retry():
             self.username = username
 
         def book(self, *args, **kwargs):
-            calls.append((self.username, kwargs.get('max_retry')))
+            calls.append((self.username, kwargs.get('max_retry'),
+                          kwargs.get('probe_count')))
             # 第一轮（max_retry=1）只有 first_pass_ok 能成功
             if kwargs.get('max_retry') == 1:
                 if self.username in first_pass_ok:
@@ -1281,7 +1282,6 @@ def test_27_sweep_all_accounts_before_retry():
         accounts = demo.load_accounts()
         defaults = demo.load_booking_config()
         defaults['concurrency-jitter'] = 0
-        defaults['max-retry'] = 32
         demo.run_all(accounts, defaults, concurrency=1)
     output = f.getvalue()
 
@@ -1308,10 +1308,17 @@ def test_27_sweep_all_accounts_before_retry():
     assert 'u1' not in retried and 'u2' not in retried, \
         "accounts that succeeded in the sweep must not be retried, got %s" % retried
 
-    # ---- 断言 4：补抢用完整重试节奏，而不是又一次单发 ----
+    # ---- 断言 4：补抢轮用配置的 max-retry（不是又一次单发） ----
     retry_budgets = {c[1] for c in calls if c[1] != 1}
-    assert retry_budgets == {32}, \
-        "retry round must use the configured max-retry, got %s" % retry_budgets
+    assert retry_budgets == {3}, \
+        "retry round must use the configured max-retry (3), got %s" % retry_budgets
+
+    # ---- 断言 4b：补抢轮跳过探路，直接猛攻 ----
+    # 探路是把次数耗在"等待"上的，而补抢时系统必然已开放 —— 必须为 0。
+    retry_probes = {c[2] for c in calls if c[1] != 1}
+    assert retry_probes == {0}, \
+        ("retry round must skip probing (probe_count=0), got %s; "
+         "probing wastes the scarce attempts on waiting" % retry_probes)
 
     # ---- 断言 5：第一轮不逐个发通知（多数会失败，属于噪音） ----
     sweep_notified = set(notified) - set(retried)
@@ -1324,7 +1331,47 @@ def test_27_sweep_all_accounts_before_retry():
 
     assert '[第一轮]' in output and '[第二轮]' in output, \
         "log must label the two rounds"
-    print("[PASS] order=%s" % [(c[0], c[1]) for c in calls])
+    print("[PASS] order=%s" % [(c[0], c[1], c[2]) for c in calls])
+
+
+def test_28_retry_round_skips_probe_uses_all_attempts():
+    """
+    补抢轮必须把全部次数用于「猛攻」，不能被探路吃掉。
+
+    这是用户明确提出的诉求："每个账号只能最多运行两次，不然很占后面时间"。
+    真正决定「一个号占住后面多久」的是补抢轮的实际等待总时长；若探路没跳过，
+    max_retry=3 会有 2 次等待 × 10 秒探路间隔 = 20 秒，而跳过探路只要 6 秒。
+    """
+    print("\n" + "=" * 60)
+    print("Test 28: retry round spends every attempt on the rush, not on probing")
+    print("=" * 60)
+    import zwulib
+
+    plan = zwulib.SeatSession._retry_intervals
+
+    # 补抢轮：probe_count=0 + max_retry=3 -> 3 次出手，等待全为猛攻间隔
+    rushed = plan(3, 10, 0, 3, 60)
+    assert len(rushed) == 3, "expected 3 attempts, got %d" % len(rushed)
+    assert set(rushed) <= {3, 0}, \
+        "probe_count=0 must leave no 10s probe waits, got %s" % rushed
+
+    # 对照：若探路没跳过，次数会被探路吃掉（这正是要避免的）
+    probed = plan(3, 10, 30, 3, 60)
+    assert len(probed) == 3, "expected 3 attempts, got %d" % len(probed)
+    assert probed == [10, 10, 0], \
+        "with probing, all attempts turn into 10s waits; got %s" % probed
+
+    # 代价对比：跳过探路把单号最坏耗时从 20s 压到 6s
+    assert sum(rushed) == 6 and sum(probed) == 20, \
+        "expected rush=%ds vs probe=%ds" % (sum(rushed), sum(probed))
+
+    # 串行下 14 个号全失败的排队时间（这是用户真正在意的数字）
+    worst_14 = 14 * (sum(rushed) + 0)  # 第一轮各 0s 等待 + 补抢轮 6s
+    assert worst_14 <= 90, \
+        "14 accounts fully failing must not queue for long, got %ds" % worst_14
+
+    print("[PASS] rush=%s (skip probe) vs probe=%s; 14-account worst case %ds"
+          % (rushed, probed, worst_14))
 
 
 if __name__ == '__main__':
@@ -1356,6 +1403,7 @@ if __name__ == '__main__':
         test_25_login_retry_rebuilds_browser,
         test_26_login_failure_is_specific,
         test_27_sweep_all_accounts_before_retry,
+        test_28_retry_round_skips_probe_uses_all_attempts,
     ]
     passed, failed = 0, 0
     try:
