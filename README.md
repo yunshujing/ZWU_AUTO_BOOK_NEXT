@@ -153,7 +153,7 @@
 | `duration`  | int  | 9              | 持续时长（小时）                                           |
 | `seat_ids`  | list | [12920, 12921] | 指定座位 ID，null 则随机选 |
 | `seats`     | list | null           | 指定座位号（选座页显示的编号），如 `[113, 114]`，自动转换为座位ID；与 `seat_ids` 同时配置时以 `seat_ids` 为准 |
-| `max-retry` | int  | 20             | 最大重试次数                                               |
+| `max-retry` | int  | 32             | 最大尝试次数上限（必须 ≥ `retry-probe-count`）               |
 
 > 未填写的字段使用 `config/booking_config.yml` 中的默认值。
 
@@ -252,7 +252,7 @@
 | `duration`  | 数字     | 持续时长（小时）                            |
 | `seat_ids`  | 文本     | 座位ID，逗号分隔，如 `12920,12921`          |
 | `seats`     | 文本     | 座位号，逗号分隔，如 `113,114`，自动转换为座位ID；与 `seat_ids` 同时填写时以 `seat_ids` 为准 |
-| `max-retry` | 数字     | 最大重试次数                                |
+| `max-retry` | 数字     | 最大尝试次数上限（必须 ≥ `retry-probe-count`） |
 
 3. 填入你的账号数据，每行一个账号。未填写的字段使用 `booking_config.yml` 默认值
 
@@ -336,7 +336,7 @@ seats:            # 指定座位号（选座页显示的编号，自动转换为
 #   - 12920
 #   - 12921
 
-max-retry: 20          # 最多重试20次
+max-retry: 32          # 最大尝试次数上限（必须 ≥ retry-probe-count）
 ```
 
 ### 4. 开启 Actions
@@ -412,14 +412,37 @@ https://api.github.com/repos/你的用户名/ZWU_AUTO_BOOK_NEXT/actions/workflow
 设置与你预约时间匹配的 cron 表达式。例如你的预约开始时间 `begin` 设在 21:00（晚上9点）：
 
 ```
-0 21 * * *
+55 20 * * *
 ```
 
-表示每天 **北京时间 21:00** 触发（cron-job.org 默认使用 UTC+8，不需要做时区转换）。
+表示每天 **北京时间 20:55** 触发（cron-job.org 默认使用 UTC+8，不需要做时区转换）。
 
 > [!TIP]
-> cron 表达式格式为 `分 时 日 月 周`。`0 21 * * *` 表示每天 21:00 执行。
+> cron 表达式格式为 `分 时 日 月 周`。`55 20 * * *` 表示每天 20:55 执行。
 > 无需像 GitHub Actions 那样转换 UTC 时间，cron-job.org 直接使用北京时间（UTC+8）。
+
+> [!IMPORTANT]
+> **为什么提前 5 分钟（20:55）而不是掐点 21:00？**
+>
+> 脚本**不需要**知道「几点开抢」—— 它登录完就立刻开始按「探路 → 猛攻」节奏试探。
+> 所以要留的是**启动 + 登录**的时间，让它能在 21:00 之前进入探路状态。
+>
+> 实测各环节耗时：
+>
+> | 环节 | 耗时 |
+> | --- | --- |
+> | cron-job.org → GitHub 派发 workflow | 数秒 ~ 十几秒 |
+> | GitHub 下载/初始化环境（冷启动） | **约 10s** |
+> | 14 个账号逐个登录 | **约 98s** |
+> | **合计** | **约 2 分钟** |
+>
+> **提前 5 分钟（20:55）** 留出约 3 分钟余量，足以覆盖 GitHub 排队抖动。
+>
+> 即便真的启动晚了也不会漏 —— 因为探路窗口有 5 分钟：
+> 20:55 启动 → 探路一直持续到 21:00，正好衔接系统开放；若 20:58 才启动，探路仍覆盖开抢瞬间。
+>
+> 反之**不建议压到 20:57 之后**：一旦 GitHub 排队多等一两分钟，
+> 登录还没完成就已经 21:00，名额可能已被抢完。
 
 ##### 其他设置
 
@@ -478,8 +501,8 @@ https://api.github.com/repos/你的用户名/ZWU_AUTO_BOOK_NEXT/actions/workflow
 | `duration`           | int | 9              | 持续时长（小时）                |
 | `seat_ids`           | list | [12920, 12921] | 指定座位 ID，null 则随机选      |
 | `seats`              | list | null           | 指定座位号（自动转换为座位ID），与 `seat_ids` 同时配置时以 `seat_ids` 为准 |
-| `retry-probe-interval` | int | 30           | 探路间隔（秒）。程序可能早于系统开放时刻启动，先用大间隔温和试探 |
-| `retry-probe-count`  | int | 8              | 探路次数上限                    |
+| `retry-probe-interval` | int | 10           | 探路间隔（秒）。程序可能早于系统开放时刻启动，先用小间隔温和试探 |
+| `retry-probe-count`  | int | 30             | 探路次数上限（10 × 30 = 5 分钟探路窗口） |
 | `retry-rush-interval` | int | 3             | 猛攻间隔（秒），系统开放后全力抢 |
 | `retry-rush-duration` | int | 60            | 猛攻持续时长（秒）              |
 | `concurrency`        | int | 1              | 抢座阶段的并发账号数。`1` = 挨个发请求（默认，最保守），`3` = 三个一批 |
@@ -487,13 +510,20 @@ https://api.github.com/repos/你的用户名/ZWU_AUTO_BOOK_NEXT/actions/workflow
 | `login-retry`        | int | 2              | 登录失败后的额外重试次数（总尝试 = 1 + 该值） |
 | `login-retry-wait`   | int | 3              | 两次登录尝试之间的等待（秒）    |
 | `cron-delta-minutes` | int | 5              | ⚠️ 已废弃，脚本启动后直接预约 |
-| `max-retry`          | int | 20             | 最大尝试次数上限                |
+| `max-retry`          | int | 32             | 最大尝试次数上限，**必须 ≥ `retry-probe-count`** |
 | `notification_type`  | str | none           | 通知方式：none / wechat / email |
 | `sckey`              | str | ''             | Server酱推送 Key                |
 
 > [!TIP]
-> **单账号最坏耗时** ≈ `retry-probe-interval × retry-probe-count + retry-rush-duration`，默认约 **4.6 分钟**（旧版固定 60 秒 × 20 次 = 20 分钟）。
+> **单账号最坏耗时** ≈ `retry-probe-interval × retry-probe-count + retry-rush-duration`，默认约 **5.0 分钟**（旧版固定 60 秒 × 20 次 = 20 分钟）。
 > 重试节奏设计为「探路 → 猛攻」，**不依赖系统时钟**：程序登录完就开始试，不管系统几点开放，只要在窗口内就一直在抢。
+>
+> **为什么探路是 10 秒而不是 30 秒**：14 个账号逐个登录约需 98 秒，若探路间隔 30 秒，
+> 排在最后的账号很可能正好卡在两个探路点之间、错过 21:00 的开抢瞬间。
+> 10 秒间隔 → 5 分钟探路窗口，能把整批账号的登录耗时完全覆盖住；且 10 秒约等于真人刷新频率，风控友好。
+>
+> ⚠️ `max-retry` **必须 ≥ `retry-probe-count`**，否则探路会被静默截断
+> （`probe_count = min(probe_count, max_retry)`），表现为「还没到猛攻阶段就没次数了」。
 
 > [!TIP]
 > **登录重试**：实测约 **10% 概率**出现登录失败——
@@ -565,6 +595,26 @@ https://api.github.com/repos/你的用户名/ZWU_AUTO_BOOK_NEXT/actions/workflow
 > 另注：冷启动（首次拉起浏览器）约 7.67s，第二次复用环境仅 0.35s。
 > 本次因座位空闲、`第 1/2 次尝试`即成功，**探路→猛攻重试节奏未被真正压测**，
 > 如需验证重试行为，应在座位紧张时段观察。
+
+> [!TIP]
+> **为什么探路间隔从 30 秒改成 10 秒（2026-09-15 定案）：**
+>
+> 实测 **14 个账号逐个登录共约 98 秒**。若探路间隔是 30 秒，排在第 10 个以后的账号
+> 登录完成时，可能正好落在两个探路点之间的空档里 —— 系统 21:00 开抢，而它下一次
+> 出手要等到 21:00:xx，**完美错过**。
+>
+> 改成 `retry-probe-interval: 10` + `retry-probe-count: 30` 后：
+>
+> | 项 | 值 |
+> | --- | --- |
+> | 探路窗口 | 10s × 30 = **5.0 分钟**（远大于 98 秒的登录耗时） |
+> | 猛攻间隔 | 3s，持续 60s |
+> | 单账号最坏耗时 | **303 秒**（旧版固定 60s × 20 = 1200 秒） |
+> | `max-retry` | **32**（必须 ≥ 探路次数 30） |
+>
+> 10 秒间隔同时也接近真人手动刷新的频率，对风控友好。
+> ⚠️ 若日后调大 `retry-probe-count`，**务必同步调大 `max-retry`**，
+> 否则探路会被 `min(probe_count, max_retry)` 静默截断。
 
 > [!IMPORTANT]
 > **第二次云端真跑抓到的问题（2026-09-15，也验证了容错设计）：**

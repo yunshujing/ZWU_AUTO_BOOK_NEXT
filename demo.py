@@ -25,9 +25,9 @@ DEFAULTS = {
     'duration': 9,
     'seat_ids': [12920, 12921],
     'cron-delta-minutes': 5,      # 已废弃，保留兼容
-    'max-retry': 20,
-    'retry-probe-interval': 30,   # 探路间隔（秒）
-    'retry-probe-count': 8,       # 探路次数上限
+    'max-retry': 32,
+    'retry-probe-interval': 10,   # 探路间隔（秒）
+    'retry-probe-count': 30,      # 探路次数上限（10s × 30 = 5 分钟探路窗口）
     'retry-rush-interval': 3,     # 猛攻间隔（秒）
     'retry-rush-duration': 60,    # 猛攻持续时长（秒）
     'concurrency': 1,             # 抢座阶段并发账号数（1 = 最保守；3 = 三个一批）
@@ -563,9 +563,9 @@ def book_session(session, params, max_retry=None):
     return session.book(
         params.get('dday'), params.get('begin'), params.get('duration'),
         seat_ids=params.get('seat_ids'),
-        max_retry=(params.get('max-retry', 20) if max_retry is None else max_retry),
-        probe_interval=params.get('retry-probe-interval', 30),
-        probe_count=params.get('retry-probe-count', 8),
+        max_retry=(params.get('max-retry', 32) if max_retry is None else max_retry),
+        probe_interval=params.get('retry-probe-interval', 10),
+        probe_count=params.get('retry-probe-count', 30),
         rush_interval=params.get('retry-rush-interval', 3),
         rush_duration=params.get('retry-rush-duration', 60),
     )

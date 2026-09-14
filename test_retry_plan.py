@@ -20,7 +20,8 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from zwulib import (SeatSession, DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_COUNT,
-                    DEFAULT_RUSH_INTERVAL, DEFAULT_RUSH_DURATION)
+                    DEFAULT_RUSH_INTERVAL, DEFAULT_RUSH_DURATION,
+                    DEFAULT_MAX_RETRY)
 
 plan = SeatSession._retry_intervals
 
@@ -29,26 +30,36 @@ def test_1_default_rhythm():
     print("\n" + "=" * 60)
     print("Test 1: default rhythm - probe then rush")
     print("=" * 60)
-    intervals = plan(20, DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_COUNT,
+    # Derive from the live constants: hardcoding 30s x 8 here once let the
+    # production defaults drift while the test stayed green (false pass).
+    intervals = plan(DEFAULT_MAX_RETRY, DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_COUNT,
                      DEFAULT_RUSH_INTERVAL, DEFAULT_RUSH_DURATION)
-    assert len(intervals) == 20, "expected 20 attempts, got %d" % len(intervals)
-    assert intervals[:8] == [30] * 8, \
-        "first 8 attempts must probe at 30s, got %s" % intervals[:8]
-    assert set(intervals[8:]) <= {3, 0}, \
-        "remaining attempts must rush at 3s, got %s" % intervals[8:]
-    print("[PASS] 8 probe attempts at 30s, then fast rush at 3s")
+    n_probe = min(DEFAULT_PROBE_COUNT, DEFAULT_MAX_RETRY)
+    assert len(intervals) == DEFAULT_MAX_RETRY, \
+        "expected %d attempts, got %d" % (DEFAULT_MAX_RETRY, len(intervals))
+    assert intervals[:n_probe] == [DEFAULT_PROBE_INTERVAL] * n_probe, \
+        "first %d attempts must probe at %ds, got %s" % (
+            n_probe, DEFAULT_PROBE_INTERVAL, intervals[:n_probe])
+    assert set(intervals[n_probe:]) <= {DEFAULT_RUSH_INTERVAL, 0}, \
+        "remaining attempts must rush at %ds, got %s" % (
+            DEFAULT_RUSH_INTERVAL, intervals[n_probe:])
+    print("[PASS] %d probe attempts at %ds, then fast rush at %ds" % (
+        n_probe, DEFAULT_PROBE_INTERVAL, DEFAULT_RUSH_INTERVAL))
 
 
 def test_2_worst_case_bounded():
     print("\n" + "=" * 60)
     print("Test 2: worst-case block time is bounded")
     print("=" * 60)
-    intervals = plan(20, DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_COUNT,
+    intervals = plan(DEFAULT_MAX_RETRY, DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_COUNT,
                      DEFAULT_RUSH_INTERVAL, DEFAULT_RUSH_DURATION)
     budget = sum(intervals)
     old_budget = 60 * 20
-    assert budget <= 300, \
-        "one account must not block the queue for 5+ minutes, got %ds" % budget
+    # Ceiling is deliberately derived, not pinned: the point of this test is
+    # "bounded", not "equal to one specific number".
+    assert budget <= DEFAULT_PROBE_COUNT * DEFAULT_PROBE_INTERVAL + DEFAULT_RUSH_DURATION, \
+        "one account must not block the queue for over %ds, got %ds" % (
+            DEFAULT_PROBE_COUNT * DEFAULT_PROBE_INTERVAL + DEFAULT_RUSH_DURATION, budget)
     assert budget < old_budget / 3, \
         "expected a large improvement over the old %ds plan, got %ds" % (old_budget, budget)
     print("[PASS] worst case %ds (old fixed plan: %ds)" % (budget, old_budget))

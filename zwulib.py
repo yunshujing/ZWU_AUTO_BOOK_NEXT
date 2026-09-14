@@ -18,12 +18,15 @@ import pandas as pd
 
 REQUEST_TIMEOUT = 30  # HTTP请求超时时间（秒）
 
-# 重试节奏：程序可能比系统开放时刻早启动，所以先「探路」（间隔大），
-# 之后转「猛攻」（间隔小）抢开抢瞬间。全程不依赖当前时钟。
-DEFAULT_PROBE_INTERVAL = 30  # 探路间隔（秒）
-DEFAULT_PROBE_COUNT = 8      # 探路次数上限
+# 重试节奏：程序可能比系统开放时刻早启动，所以先「探路」持续试探，
+# 之后转「猛攻」（间隔更小）抢开抢瞬间。全程不依赖当前时钟。
+# 探路间隔取 10s 而非 30s：账号多时抢座阶段开始得晚，间隔过大会让开抢瞬间
+# 落在两枪之间的空档里（最坏错过近 30s），10s 可把最坏错过压到 10s 以内。
+DEFAULT_PROBE_INTERVAL = 10  # 探路间隔（秒）
+DEFAULT_PROBE_COUNT = 30     # 探路次数上限（10s × 30 = 5 分钟探路窗口）
 DEFAULT_RUSH_INTERVAL = 3    # 猛攻间隔（秒）
 DEFAULT_RUSH_DURATION = 60   # 猛攻持续时长（秒），用于换算猛攻次数
+DEFAULT_MAX_RETRY = 32       # 最大尝试次数，必须 ≥ DEFAULT_PROBE_COUNT，否则探路会被截断
 CANDIDATE_SEAT_INTERVAL = 2  # 同一账号尝试下一个候选座位的间隔（秒）
 
 # 登录重试：站点偶发慢响应会让 WebDriverWait 超时（实测约 10% 概率），
@@ -198,7 +201,7 @@ class SeatSession:
         # 所有座位都试过了，返回最后一个结果
         return code, msg, seat_id
 
-    def book(self, dday, start_hour, duration, seat_ids=None, max_retry=20,
+    def book(self, dday, start_hour, duration, seat_ids=None, max_retry=DEFAULT_MAX_RETRY,
              probe_interval=DEFAULT_PROBE_INTERVAL,
              probe_count=DEFAULT_PROBE_COUNT,
              rush_interval=DEFAULT_RUSH_INTERVAL,
@@ -454,7 +457,7 @@ def _close(booker):
 
 
 def appoint_zwulib(username, password, room_id=2, dday=2, begin=12, duration=9,
-                   seat_ids=None, cron_delta_minutes=5, max_retry=20,
+                   seat_ids=None, cron_delta_minutes=5, max_retry=DEFAULT_MAX_RETRY,
                    probe_interval=DEFAULT_PROBE_INTERVAL,
                    probe_count=DEFAULT_PROBE_COUNT,
                    rush_interval=DEFAULT_RUSH_INTERVAL,
