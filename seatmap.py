@@ -66,6 +66,45 @@ def resolve_seats(room_id, seat_numbers):
     return seat_ids
 
 
+_seat_info_index_cache = None  # {座位ID: (自习室名, 座位号)}，进程内只建一次
+
+
+def _build_seat_info_index():
+    """基于 load_seat_map() 的缓存构建「座位ID → (自习室名, 座位号)」反查索引"""
+    global _seat_info_index_cache
+    if _seat_info_index_cache is None:
+        index = {}
+        for room_id, room_map in load_seat_map().items():
+            room_name = ROOM_NAMES[room_id]
+            for title, seat_id in room_map.items():
+                index[seat_id] = (room_name, title)
+        _seat_info_index_cache = index
+    return _seat_info_index_cache
+
+
+def get_seat_info(seat_id):
+    """
+    座位ID → {'room', 'title', 'id'}（通知模块使用）
+
+    复用 load_seat_map() 的进程内缓存，避免每次发通知都重新解析 xlsx；
+    非法输入或座位表不可读时降级为「未知」占位，不影响通知本身。
+    """
+    fallback = {'room': '未知', 'title': str(seat_id), 'id': str(seat_id)}
+    try:
+        key = int(seat_id)
+    except (TypeError, ValueError):
+        return fallback
+    try:
+        matched = _build_seat_info_index().get(key)
+    except Exception:
+        # 座位表读不出来时不能让通知本身挂掉
+        return fallback
+    if matched is None:
+        return fallback
+    room_name, title = matched
+    return {'room': room_name, 'title': str(title), 'id': str(key)}
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: python seatmap.py <自习室编号> [座位号...]")

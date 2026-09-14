@@ -2,6 +2,11 @@ name: ZWU Auto BOOK
 
 on:
   workflow_dispatch:  # 支持手动触发
+    inputs:
+      dry_run:
+        description: 'DRY RUN：只验证登录，不发起预约（不会占座、不发通知）'
+        type: boolean
+        default: false
   # schedule:
   #   - cron: '57 12 * * *'  # UTC 12:57 = 北京时间 20:57（已改用 cron-job.org 触发，见 README）
 
@@ -28,6 +33,7 @@ jobs:
 
       - name: Run Auto BOOK
         env:
+          DRY_RUN: ${{ inputs.dry_run }}                  # 手动触发时的 DRY RUN 开关（只验证登录）
           SCKEY: ${{ secrets.SCKEY }}
           ACCOUNTS: ${{ secrets.ACCOUNTS }}              # 老用法（后向兼容，保留）
           ACCOUNTS_CONFIG: ${{ vars.ACCOUNTS_CONFIG }}    # 新用法：明文 Variable（账号清单 + 覆盖配置）

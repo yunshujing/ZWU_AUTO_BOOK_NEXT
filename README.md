@@ -33,6 +33,7 @@
 - [📦 配置参数说明](#-配置参数说明)
 - [💬 通知配置](#-通知配置)
 - [🖥️ 本地化部署](#️-本地化部署)
+- [🧪 测试与验证](#-测试与验证)
 - [📁 文件结构](#-文件结构)
 - [🙏 致谢](#-致谢)
 - [📄 开源协议](#-开源协议)
@@ -475,10 +476,22 @@ https://api.github.com/repos/你的用户名/ZWU_AUTO_BOOK_NEXT/actions/workflow
 | `duration`           | int | 9              | 持续时长（小时）                |
 | `seat_ids`           | list | [12920, 12921] | 指定座位 ID，null 则随机选      |
 | `seats`              | list | null           | 指定座位号（自动转换为座位ID），与 `seat_ids` 同时配置时以 `seat_ids` 为准 |
+| `retry-probe-interval` | int | 30           | 探路间隔（秒）。程序可能早于系统开放时刻启动，先用大间隔温和试探 |
+| `retry-probe-count`  | int | 8              | 探路次数上限                    |
+| `retry-rush-interval` | int | 3             | 猛攻间隔（秒），系统开放后全力抢 |
+| `retry-rush-duration` | int | 60            | 猛攻持续时长（秒）              |
 | `cron-delta-minutes` | int | 5              | ⚠️ 已废弃，脚本启动后直接预约 |
-| `max-retry`          | int | 20             | 最大重试次数                    |
+| `max-retry`          | int | 20             | 最大尝试次数上限                |
 | `notification_type`  | str | none           | 通知方式：none / wechat / email |
 | `sckey`              | str | ''             | Server酱推送 Key                |
+
+> [!TIP]
+> **单账号最坏耗时** ≈ `retry-probe-interval × retry-probe-count + retry-rush-duration`，默认约 **4.6 分钟**（旧版固定 60 秒 × 20 次 = 20 分钟）。
+> 重试节奏设计为「探路 → 猛攻」，**不依赖系统时钟**：程序登录完就开始试，不管系统几点开放，只要在窗口内就一直在抢。
+
+> [!NOTE]
+> **环境变量 `LOGIN_WAIT_MODE`**（可选）：默认 `url`，登录后等待 URL 跳出登录页即继续。
+> 若站点改版导致登录后不更换 URL，设为 `fixed` 可回退到旧的固定等待 8 秒。
 
 ---
 
@@ -608,6 +621,56 @@ python update_driver.py
 
 ---
 
+## 🧪 测试与验证
+
+分三层，从零风险到真实预约。**建议按顺序来** —— 哪一层失败就能直接定位到哪一层，不会把"代码写错"和"登录被改坏"混在一起。
+
+### 第 0 层：离线自测（不联网、不占座、不用账号）
+
+```bash
+python test_config_layering.py   # 配置分层 + 账号异常隔离（21 项）
+python test_seatmap.py           # 座位号转换 + 座位信息缓存（13 项）
+python test_retry_plan.py        # 抢座重试节奏（7 项）
+```
+
+三个脚本内部都 mock 掉了真实预约，可随时运行，用于确认代码本身没写错。
+
+### 第 1 层：只验证登录（不占座、不发通知）
+
+```bash
+# Linux / macOS
+DRY_RUN=1 python demo.py
+
+# Windows PowerShell
+$env:DRY_RUN=1; python demo.py
+```
+
+`DRY_RUN=1` 时程序走完「启动浏览器 → 登录 → 取 UID」就停止，**不会发出任何预约请求，也不会发送通知**，可以放心验证登录链路。
+
+输出示例：
+
+```
+DRY RUN 模式：只验证登录，不发起任何预约请求（不会占座、不发通知）
+[timer] user=2023xxxx 启动=2.31s 登录=1.84s 取UID=0.42s 收尾=0.55s 合计=5.12s
+[dry-run] 2023xxxx 登录链路正常
+DRY RUN 汇总: 1 登录成功 / 0 失败 / 0 跳过 (共 1 个账号)
+```
+
+> [!NOTE]
+> 本地运行需要 `config/accounts_config.json`（含学号密码，请勿提交到仓库）。
+> 没有 `chromedriver` 时程序会自动下载，无需手动处理。
+
+### 第 2 层：完整真跑（**会真的预约座位**）
+
+在 GitHub **Actions** 页签手动触发 **Run workflow**；勾选 `dry_run` 即等价于第 1 层。
+
+> [!WARNING]
+> 不勾选 `dry_run` 时会真的预约座位，每次占用一个真实名额。请遵守项目使用协议，不要"预约但不去签到"。
+
+**排查建议**：若第 1 层失败，说明登录链路被改坏了，可设置环境变量 `LOGIN_WAIT_MODE=fixed` 回退到旧的固定等待方式，无需回滚代码。
+
+---
+
 ## 📁 文件结构
 
 ```
@@ -617,8 +680,9 @@ ZWU_AUTO_BOOK_NEXT/
 ├── seatmap.py                       # 座位号→座位ID 映射转换 + 命令行查询工具
 ├── notice.py                        # 通知模块（Server酱 + 邮件）
 ├── update_driver.py                 # ChromeDriver 自动更新工具（本地用）
-├── test_config_layering.py          # 配置分层测试（8项场景全覆盖）
-├── test_seatmap.py                  # 座位号转换测试（12项场景全覆盖）
+├── test_config_layering.py          # 配置分层 + 账号异常隔离 + DRY RUN 测试（21项场景）
+├── test_seatmap.py                  # 座位号转换 + 座位信息缓存测试（13项场景）
+├── test_retry_plan.py               # 抢座重试节奏测试（7项场景）
 ├── _config.yml                      # API 配置
 ├── requirements.txt                 # Python 依赖
 ├── zwu_lib.xlsx                     # 座位信息映射表

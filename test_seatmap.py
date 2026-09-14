@@ -22,7 +22,7 @@ ACCOUNTS_FILE = os.path.join(BASE_DIR, 'config', 'accounts_config.json')
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-from seatmap import load_seat_map, resolve_seats
+from seatmap import load_seat_map, resolve_seats, get_seat_info
 
 
 def _reload_demo():
@@ -35,13 +35,33 @@ def _reload_demo():
 def _clean_env():
     for k in ('ACCOUNTS', 'ACCOUNTS_CONFIG', 'PASSWORDS',
               'FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'FEISHU_APP_TOKEN', 'FEISHU_TABLE_ID',
-              'FEISHU_PASSWORD_TABLE_ID'):
+              'FEISHU_PASSWORD_TABLE_ID', 'DRY_RUN'):
         os.environ.pop(k, None)
 
 
+_ACCOUNTS_BACKUP = ACCOUNTS_FILE + '.testhidden'
+_local_file_hidden = False
+
+
 def _ensure_no_local_file():
+    """
+    真实本地配置会盖住测试要验证的环境变量分支，所以运行前把它临时挪开，
+    测试结束后自动放回（而不是直接报错退出）。
+    """
+    global _local_file_hidden
     if os.path.exists(ACCOUNTS_FILE):
-        raise RuntimeError("Local file %s exists, will interfere with branch tests" % ACCOUNTS_FILE)
+        os.replace(ACCOUNTS_FILE, _ACCOUNTS_BACKUP)
+        _local_file_hidden = True
+        print("提示: 已临时移开本地 %s，测试结束后自动恢复"
+              % os.path.basename(ACCOUNTS_FILE))
+
+
+def _restore_local_file():
+    global _local_file_hidden
+    if _local_file_hidden and os.path.exists(_ACCOUNTS_BACKUP):
+        os.replace(_ACCOUNTS_BACKUP, ACCOUNTS_FILE)
+        _local_file_hidden = False
+        print("提示: 本地 %s 已恢复" % os.path.basename(ACCOUNTS_FILE))
 
 
 # 已核对的已知映射（README 默认 seat_ids 12920/12921 实际是自习室114的113/114号座位）
@@ -192,7 +212,11 @@ def test_10_default_level_resolution():
 
 
 def _run_main_loop_with_mock(demo, captured):
-    """Mirror of demo.py main loop with mocked appoint/notify."""
+    """Drive the REAL production loop (demo.process_account) with mocked booking.
+
+    Delegates to demo.process_account on purpose: a locally copied loop would keep
+    passing after demo.py changes and mask regressions.
+    """
     def fake_appoint(username, password, **kwargs):
         captured.append({'username': username, 'seat_ids': kwargs.get('seat_ids'),
                          'room_id': kwargs.get('room_id')})
@@ -206,26 +230,9 @@ def _run_main_loop_with_mock(demo, captured):
     with redirect_stdout(f):
         accounts = demo.load_accounts()
         defaults = demo.load_booking_config()
-        for i, account in enumerate(accounts, 1):
-            username = account.get('username', '')
-            password = account.get('password', '')
-            if not username or not password:
-                continue
-            if account.get('enabled', True) is False:
-                continue
-            params = {**defaults, **{k: v for k, v in account.items()
-                      if k not in ('username', 'password', 'enabled')}}
-            params['seat_ids'] = demo.resolve_final_seats(account, defaults)
-            demo.appoint_zwulib(
-                username, password,
-                room_id=params.get('room_id'),
-                dday=params.get('dday'),
-                begin=params.get('begin'),
-                duration=params.get('duration'),
-                seat_ids=params.get('seat_ids'),
-                cron_delta_minutes=params.get('cron-delta-minutes', 5),
-                max_retry=params.get('max-retry', 20),
-            )
+        total = len(accounts)
+        [demo.process_account(i, total, account, defaults)
+         for i, account in enumerate(accounts, 1)]
     return f.getvalue()
 
 
@@ -293,6 +300,80 @@ def test_12_feishu_seats_field():
     print("[PASS] feishu seats text/list formats parsed into int lists")
 
 
+def test_13_get_seat_info_reuses_cache():
+    print("\n" + "=" * 60)
+    print("Test 13: get_seat_info - correct reverse lookup, xlsx parsed once")
+    print("=" * 60)
+    import pandas as pd
+
+    info = get_seat_info(12920)
+    assert info['room'] == '自习室114', "wrong room for 12920, got %s" % info['room']
+    assert info['title'] == '113', "wrong seat number for 12920, got %s" % info['title']
+    assert info['id'] == '12920'
+
+    # 非法/未知输入要降级成占位，不能让通知本身挂掉
+    for bad in (None, 'abc', '', 99999999):
+        fallback = get_seat_info(bad)
+        assert fallback['room'] == '未知', \
+            "bad input %r should degrade to placeholder, got %s" % (bad, fallback)
+        assert fallback['id'] == str(bad)
+
+    # 缓存生效：后续查询不应再解析 xlsx（旧实现每次通知都重新 read_excel）
+    reads = {'n': 0}
+    real_read_excel = pd.read_excel
+
+    def counting_read_excel(*args, **kwargs):
+        reads['n'] += 1
+        return real_read_excel(*args, **kwargs)
+
+    pd.read_excel = counting_read_excel
+    try:
+        get_seat_info(12921)
+        get_seat_info(12922)
+    finally:
+        pd.read_excel = real_read_excel
+
+    assert reads['n'] == 0, \
+        "cached reverse lookups must not re-parse the workbook, got %d reads" % reads['n']
+    print("[PASS] reverse lookup correct, bad input degrades gracefully, workbook parsed once")
+
+
+def test_14_notification_content_after_seatmap_move():
+    print("\n" + "=" * 60)
+    print("Test 14: notification content unchanged after get_seat_info moved")
+    print("=" * 60)
+    import notice
+
+    captured = {}
+
+    class FakeResp:
+        def json(self):
+            return {'code': 0}
+
+    def fake_post(url, data=None, timeout=None, **kwargs):
+        captured['url'] = url
+        captured['data'] = data
+        return FakeResp()
+
+    real_post = notice.requests.post
+    notice.requests.post = fake_post
+    try:
+        notice.notify('2023xxxx', 2, 12920,
+                      {'notification_type': 'wechat', 'sckey': 'FAKEKEY',
+                       'begin': 12, 'duration': 9})
+    finally:
+        notice.requests.post = real_post
+
+    assert 'FAKEKEY' in captured['url'], "sckey must be used in the endpoint"
+    content = captured['data']['desp']
+    assert '自习室114' in content, "room name missing:\n%s" % content
+    assert '座位号: 113' in content, "seat number missing:\n%s" % content
+    assert '座位ID: 12920' in content, "seat id missing:\n%s" % content
+    assert '12:00 ~ 21:00' in content, "time range wrong:\n%s" % content
+    assert '9h' in content, "duration missing:\n%s" % content
+    print("[PASS] notification renders room/seat/time correctly via cached lookup")
+
+
 if __name__ == '__main__':
     tests = [
         test_1_seat_map_structure,
@@ -307,19 +388,24 @@ if __name__ == '__main__':
         test_10_default_level_resolution,
         test_11_main_loop_seats_end_to_end,
         test_12_feishu_seats_field,
+        test_13_get_seat_info_reuses_cache,
+        test_14_notification_content_after_seatmap_move,
     ]
     passed, failed = 0, 0
-    for t in tests:
-        try:
-            t()
-            passed += 1
-        except AssertionError as e:
-            print("[FAIL] %s - %s" % (t.__name__, e))
-            failed += 1
-        except Exception as e:
-            print("[FAIL] %s - %s: %s" % (t.__name__, type(e).__name__, e))
-            failed += 1
-    _clean_env()
+    try:
+        for t in tests:
+            try:
+                t()
+                passed += 1
+            except AssertionError as e:
+                print("[FAIL] %s - %s" % (t.__name__, e))
+                failed += 1
+            except Exception as e:
+                print("[FAIL] %s - %s: %s" % (t.__name__, type(e).__name__, e))
+                failed += 1
+    finally:
+        _clean_env()
+        _restore_local_file()
     print("\n" + "=" * 60)
     print("Result: %d passed, %d failed (total %d)" % (passed, failed, len(tests)))
     print("=" * 60)

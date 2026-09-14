@@ -24,8 +24,13 @@ def _reload_demo():
     return demo
 
 
-def _run_main_loop(demo):
-    """Run the main loop with mocked appoint/notify, return processed accounts + output."""
+def _run_main_loop_ex(demo):
+    """Drive the REAL production loop (demo.process_account) with mocked booking.
+
+    Returns (processed, output, results). Keep this delegating to demo.process_account
+    instead of copying the loop here — a copied loop would keep passing after demo.py
+    changes, which is exactly the regression we need to catch.
+    """
     processed = []
 
     def fake_appoint(username, password, **kwargs):
@@ -46,37 +51,50 @@ def _run_main_loop(demo):
     with redirect_stdout(f):
         accounts = demo.load_accounts()
         defaults = demo.load_booking_config()
-        for i, account in enumerate(accounts, 1):
-            username = account.get('username', '')
-            password = account.get('password', '')
-            if not username or not password:
-                continue
-            if account.get('enabled', True) is False:
-                continue
-            params = {**defaults, **{k: v for k, v in account.items()
-                      if k not in ('username', 'password', 'enabled')}}
-            demo.appoint_zwulib(
-                username, password,
-                room_id=params.get('room_id'),
-                dday=params.get('dday'),
-                begin=params.get('begin'),
-                duration=params.get('duration'),
-                seat_ids=params.get('seat_ids'),
-                cron_delta_minutes=params.get('cron-delta-minutes', 5),
-                max_retry=params.get('max-retry', 20),
-            )
-    return processed, f.getvalue()
+        total = len(accounts)
+        results = [demo.process_account(i, total, account, defaults)
+                   for i, account in enumerate(accounts, 1)]
+    return processed, f.getvalue(), results
+
+
+def _run_main_loop(demo):
+    """Backward-compatible wrapper returning (processed, output)."""
+    processed, output, _ = _run_main_loop_ex(demo)
+    return processed, output
+
+
+_ACCOUNTS_BACKUP = ACCOUNTS_FILE + '.testhidden'
+_local_file_hidden = False
 
 
 def _ensure_no_local_file():
+    """
+    真实本地配置会盖住测试要验证的环境变量分支，所以运行前把它临时挪开，
+    测试结束（含异常/中断）后自动放回。
+
+    刻意不采用「检测到就报错退出」的做法：那样开发者一旦配好账号文件，
+    这套测试就再也跑不了了 —— 而配好账号文件才是正常状态。
+    """
+    global _local_file_hidden
     if os.path.exists(ACCOUNTS_FILE):
-        raise RuntimeError("Local file %s exists, will interfere with branch tests" % ACCOUNTS_FILE)
+        os.replace(ACCOUNTS_FILE, _ACCOUNTS_BACKUP)
+        _local_file_hidden = True
+        print("提示: 已临时移开本地 %s，测试结束后自动恢复"
+              % os.path.basename(ACCOUNTS_FILE))
+
+
+def _restore_local_file():
+    global _local_file_hidden
+    if _local_file_hidden and os.path.exists(_ACCOUNTS_BACKUP):
+        os.replace(_ACCOUNTS_BACKUP, ACCOUNTS_FILE)
+        _local_file_hidden = False
+        print("提示: 本地 %s 已恢复" % os.path.basename(ACCOUNTS_FILE))
 
 
 def _clean_env():
     for k in ('ACCOUNTS', 'ACCOUNTS_CONFIG', 'PASSWORDS',
               'FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'FEISHU_APP_TOKEN', 'FEISHU_TABLE_ID',
-              'FEISHU_PASSWORD_TABLE_ID'):
+              'FEISHU_PASSWORD_TABLE_ID', 'DRY_RUN'):
         os.environ.pop(k, None)
 
 
@@ -199,8 +217,7 @@ def test_7_local_file_priority():
     print("Test 7: local file has highest priority")
     print("=" * 60)
     tmp_content = [{"username": "local_user", "password": "local_pass"}]
-    if os.path.exists(ACCOUNTS_FILE):
-        raise RuntimeError("%s already exists, skip test to avoid overwriting real config" % ACCOUNTS_FILE)
+    _ensure_no_local_file()  # 真实配置已临时挪开，不会被覆盖
     try:
         with open(ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
             json.dump(tmp_content, f)
@@ -242,25 +259,9 @@ def test_8_enabled_field_not_in_params():
     with redirect_stdout(f):
         accounts = demo.load_accounts()
         defaults = demo.load_booking_config()
+        total = len(accounts)
         for i, account in enumerate(accounts, 1):
-            username = account.get('username', '')
-            password = account.get('password', '')
-            if not username or not password:
-                continue
-            if account.get('enabled', True) is False:
-                continue
-            params = {**defaults, **{k: v for k, v in account.items()
-                      if k not in ('username', 'password', 'enabled')}}
-            demo.appoint_zwulib(
-                username, password,
-                room_id=params.get('room_id'),
-                dday=params.get('dday'),
-                begin=params.get('begin'),
-                duration=params.get('duration'),
-                seat_ids=params.get('seat_ids'),
-                cron_delta_minutes=params.get('cron-delta-minutes', 5),
-                max_retry=params.get('max-retry', 20),
-            )
+            demo.process_account(i, total, account, defaults)
 
     assert 'enabled' not in captured, "enabled should not be in params, got: %s" % list(captured.keys())
     assert captured.get('room_id') == 3
@@ -651,6 +652,210 @@ def test_17_feishu_password_table_list_format_without_passwords_secret():
     print("[PASS] list-format password fields parsed, missing user skipped loudly, no PASSWORDS needed")
 
 
+def test_18_account_exception_isolation():
+    print("\n" + "=" * 60)
+    print("Test 18: single account exception does not abort the batch")
+    print("=" * 60)
+    _ensure_no_local_file()
+    _clean_env()
+    os.environ['ACCOUNTS_CONFIG'] = json.dumps([
+        {"username": "boom_user"},
+        {"username": "good_user"},
+        {"username": "after_user"},
+    ])
+    os.environ['PASSWORDS'] = json.dumps(
+        {"boom_user": "p1", "good_user": "p2", "after_user": "p3"})
+    demo = _reload_demo()
+
+    attempted = []
+    notified = []
+    failed_notices = []
+
+    def fake_appoint(username, password, **kwargs):
+        attempted.append(username)
+        if username == 'boom_user':
+            raise RuntimeError("chrome failed to start")  # 模拟浏览器启动失败
+        return 'ok', 'mock success', 12920
+
+    demo.appoint_zwulib = fake_appoint
+    demo.notify = lambda user, *a, **k: notified.append(user)
+    demo.notify_fail = lambda user, reason, *a, **k: failed_notices.append((user, reason))
+
+    f = io.StringIO()
+    with redirect_stdout(f):
+        accounts = demo.load_accounts()
+        defaults = demo.load_booking_config()
+        total = len(accounts)
+        results = [demo.process_account(i, total, account, defaults)
+                   for i, account in enumerate(accounts, 1)]
+
+    # 核心断言：出错账号之后的账号仍被执行（旧实现在这里会整批中断）
+    assert attempted == ['boom_user', 'good_user', 'after_user'], \
+        "all accounts must be attempted, got %s" % attempted
+
+    by_name = {r['username']: r for r in results}
+    assert by_name['boom_user']['stat'] == 'fail', "failing account should be marked fail"
+    assert by_name['good_user']['stat'] == 'ok'
+    assert by_name['after_user']['stat'] == 'ok'
+
+    # 出错账号必须收到失败通知，不能静默消失
+    assert len(failed_notices) == 1, \
+        "failing account should still be notified, got %s" % failed_notices
+    assert failed_notices[0][0] == 'boom_user'
+    assert notified == ['good_user', 'after_user'], \
+        "successful accounts must still be notified, got %s" % notified
+
+    # 通知里应该是人话，而不是异常原文
+    assert 'chrome' not in failed_notices[0][1].lower(), \
+        "raw exception text must not leak into the notice, got %s" % failed_notices[0][1]
+    print("[PASS] exception isolated to its own account; every account still notified")
+
+
+def test_19_summary_reports_every_account():
+    print("\n" + "=" * 60)
+    print("Test 19: summary accounts for every account (no silent disappearance)")
+    print("=" * 60)
+    _ensure_no_local_file()
+    _clean_env()
+    os.environ['ACCOUNTS_CONFIG'] = json.dumps([
+        {"username": "ok_user"},
+        {"username": "fail_user"},
+        {"username": "off_user", "enabled": False},
+    ])
+    os.environ['PASSWORDS'] = json.dumps(
+        {"ok_user": "p1", "fail_user": "p2", "off_user": "p3"})
+    demo = _reload_demo()
+
+    def fake_appoint(username, password, **kwargs):
+        if username == 'fail_user':
+            return 'fail', '无可用座位', None
+        return 'ok', 'mock success', 12920
+
+    demo.appoint_zwulib = fake_appoint
+    demo.notify = lambda *a, **k: None
+    demo.notify_fail = lambda *a, **k: None
+
+    f = io.StringIO()
+    with redirect_stdout(f):
+        accounts = demo.load_accounts()
+        defaults = demo.load_booking_config()
+        total = len(accounts)
+        results = [demo.process_account(i, total, account, defaults)
+                   for i, account in enumerate(accounts, 1)]
+        demo.print_summary(results)
+    output = f.getvalue()
+
+    assert "1 成功 / 1 失败 / 1 跳过" in output, "summary counts wrong:\n%s" % output
+    assert 'fail_user' in output and '无可用座位' in output, "failure reason must be listed"
+    assert 'off_user' in output and '已停用' in output, "skip reason must be listed"
+    print("[PASS] summary lists counts plus every failure/skip reason")
+
+
+def test_20_dry_run_sends_no_notification():
+    print("\n" + "=" * 60)
+    print("Test 20: DRY RUN verifies login only, never sends a notification")
+    print("=" * 60)
+    _ensure_no_local_file()
+    _clean_env()
+    os.environ['DRY_RUN'] = '1'
+    os.environ['ACCOUNTS_CONFIG'] = json.dumps([{"username": "dry_user"}])
+    os.environ['PASSWORDS'] = json.dumps({"dry_user": "p1"})
+    demo = _reload_demo()
+
+    assert demo._is_dry_run() is True, "DRY_RUN=1 must be recognised"
+    for falsy in ('0', 'false', 'no', ''):
+        os.environ['DRY_RUN'] = falsy
+        assert demo._is_dry_run() is False, "DRY_RUN=%r must not enable dry run" % falsy
+    os.environ['DRY_RUN'] = '1'
+
+    booked = []
+    notices = []
+    failures = []
+
+    def fake_appoint(username, password, **kwargs):
+        booked.append(kwargs.get('dry_run'))
+        return 'ok', 'DRY RUN: 登录成功，未发起预约', None
+
+    demo.appoint_zwulib = fake_appoint
+    demo.notify = lambda *a, **k: notices.append(a)
+    demo.notify_fail = lambda *a, **k: failures.append(a)
+
+    f = io.StringIO()
+    with redirect_stdout(f):
+        accounts = demo.load_accounts()
+        defaults = demo.load_booking_config()
+        total = len(accounts)
+        results = [demo.process_account(i, total, account, defaults)
+                   for i, account in enumerate(accounts, 1)]
+        demo.print_summary(results, dry_run=True)
+    output = f.getvalue()
+
+    assert booked == [True], \
+        "dry_run flag must reach appoint_zwulib, got %s" % booked
+    assert notices == [], \
+        "DRY RUN must never send a success notice (would be a fake booking), got %s" % notices
+    assert 'DRY RUN' in output and '未发起任何预约请求' in output
+
+    # 登录失败时同样不发通知，但要如实报告
+    demo.appoint_zwulib = lambda *a, **k: ('fail', '登录失败', None)
+    f2 = io.StringIO()
+    with redirect_stdout(f2):
+        r = demo.process_account(1, 1, {'username': 'dry_user', 'password': 'p1'},
+                                 demo.load_booking_config())
+    assert r['stat'] == 'fail'
+    assert failures == [], "DRY RUN must not send failure notices either"
+    assert '登录链路失败' in f2.getvalue(), "dry run must report the failure honestly"
+    print("[PASS] dry run forwards flag, sends no notice, reports honestly")
+
+
+def test_21_appoint_dry_run_skips_booking():
+    print("\n" + "=" * 60)
+    print("Test 21: appoint_zwulib(dry_run=True) never reaches the booking call")
+    print("=" * 60)
+    import zwulib
+
+    calls = {'login': 0, 'uid': 0, 'book': 0, 'quit': 0}
+
+    class FakeBooker:
+        """Stands in for SeatAutoBooker so no browser is launched."""
+
+        def __init__(self, username, password, room_id, seat_ids):
+            self.driver = self
+
+        def login(self):
+            calls['login'] += 1
+            return 0
+
+        def get_user_info(self):
+            calls['uid'] += 1
+            return 0
+
+        def book_favorite_seat(self, *args, **kwargs):
+            calls['book'] += 1
+            return 'ok', 'should never happen in dry run', 12920
+
+        def quit(self):
+            calls['quit'] += 1
+
+    real = zwulib.SeatAutoBooker
+    zwulib.SeatAutoBooker = FakeBooker
+    try:
+        f = io.StringIO()
+        with redirect_stdout(f):
+            stat, msg, seatid = zwulib.appoint_zwulib('u', 'p', dry_run=True)
+    finally:
+        zwulib.SeatAutoBooker = real
+
+    assert stat == 'ok', "successful login under dry run should report ok, got %s" % stat
+    assert calls['login'] == 1, "login must still run (that is the whole point)"
+    assert calls['uid'] == 1, "uid lookup must still run to prove the session works"
+    assert calls['book'] == 0, \
+        "DRY RUN MUST NOT call book_favorite_seat, got %d call(s)" % calls['book']
+    assert calls['quit'] == 1, "the browser must still be cleaned up"
+    assert 'DRY RUN' in f.getvalue()
+    print("[PASS] dry run stops before booking and still cleans up the browser")
+
+
 if __name__ == '__main__':
     tests = [
         test_1_old_accounts_compat,
@@ -670,19 +875,27 @@ if __name__ == '__main__':
         test_15_feishu_text_field_as_list,
         test_16_feishu_password_table_priority_and_fallback,
         test_17_feishu_password_table_list_format_without_passwords_secret,
+        test_18_account_exception_isolation,
+        test_19_summary_reports_every_account,
+        test_20_dry_run_sends_no_notification,
+        test_21_appoint_dry_run_skips_booking,
     ]
     passed, failed = 0, 0
-    for t in tests:
-        try:
-            t()
-            passed += 1
-        except AssertionError as e:
-            print("[FAIL] %s - %s" % (t.__name__, e))
-            failed += 1
-        except Exception as e:
-            print("[FAIL] %s - %s: %s" % (t.__name__, type(e).__name__, e))
-            failed += 1
-    _clean_env()
+    try:
+        for t in tests:
+            try:
+                t()
+                passed += 1
+            except AssertionError as e:
+                print("[FAIL] %s - %s" % (t.__name__, e))
+                failed += 1
+            except Exception as e:
+                print("[FAIL] %s - %s: %s" % (t.__name__, type(e).__name__, e))
+                failed += 1
+    finally:
+        # 无论正常结束、断言失败还是被 Ctrl+C 打断，都要把真实配置放回去
+        _clean_env()
+        _restore_local_file()
     print("\n" + "=" * 60)
     print("Result: %d passed, %d failed (total %d)" % (passed, failed, len(tests)))
     print("=" * 60)

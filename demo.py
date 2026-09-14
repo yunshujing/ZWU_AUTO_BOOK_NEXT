@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import yaml
 import requests
 from zwulib import appoint_zwulib
@@ -21,8 +22,12 @@ DEFAULTS = {
     'begin': 12,
     'duration': 9,
     'seat_ids': [12920, 12921],
-    'cron-delta-minutes': 5,
+    'cron-delta-minutes': 5,      # 已废弃，保留兼容
     'max-retry': 20,
+    'retry-probe-interval': 30,   # 探路间隔（秒）
+    'retry-probe-count': 8,       # 探路次数上限
+    'retry-rush-interval': 3,     # 猛攻间隔（秒）
+    'retry-rush-duration': 60,    # 猛攻持续时长（秒）
     'notification_type': 'none',
     'sckey': '',
     'smtp': {},
@@ -414,42 +419,66 @@ def load_booking_config():
     return config
 
 
-if __name__ == '__main__':
-    accounts = load_accounts()
-    defaults = load_booking_config()
+def _is_dry_run():
+    """
+    DRY_RUN=1 时只验证登录链路，不发起任何预约请求（不会占座）。
+    用于本地/云端安全地确认登录逻辑没被改坏，并采集真实的登录耗时。
+    """
+    return os.environ.get('DRY_RUN', '').strip().lower() in ('1', 'true', 'yes', 'on')
 
-    if not accounts:
-        print("无账号配置，退出")
-        exit(1)
 
-    print(f"共 {len(accounts)} 个账号待预约")
+def _friendly_error(exc):
+    """把异常翻译成适合写进通知的人话（完整报错仍留在运行日志里）"""
+    name = exc.__class__.__name__
+    lowered = str(exc).lower()
+    if 'webdriver' in name.lower() or 'chrome' in lowered or 'chromedriver' in lowered:
+        return '浏览器启动失败'
+    if 'timeout' in name.lower():
+        return '等待超时，页面响应过慢'
+    return f'执行异常（{name}，详细原因见运行日志）'
 
-    for i, account in enumerate(accounts, 1):
-        username = account.get('username', '')
-        password = account.get('password', '')
 
-        if not username or not password:
-            print(f"跳过第 {i} 个账号: 缺少 username 或 password")
-            continue
+def process_account(index, total, account, defaults, max_retry=None):
+    """
+    处理单个账号：校验 → 参数合并 → 座位解析 → 预约 → 通知。
 
-        # 停用开关（所有加载路径统一生效，未配置 enabled 默认为启用）
-        if account.get('enabled', True) is False:
-            print(f"跳过第 {i} 个账号 {username}: 已停用 (enabled=false)")
-            continue
+    任何异常都在此捕获并转成失败结果，因此单个账号出问题不会影响其他账号
+    （例如 Chrome 启动失败时，后续账号仍会继续预约）。
+    max_retry 为 None 时使用参数合并结果中的值。
 
-        # 合并: 账号级覆盖 > 默认配置（排除 username/password/enabled 等非预约参数）
-        params = {**defaults, **{k: v for k, v in account.items()
-                  if k not in ('username', 'password', 'enabled')}}
+    返回 dict: {'username', 'skipped', 'skip_reason', 'stat', 'msg', 'seatid'}
+    被跳过的账号 stat 为 None。
+    """
+    username = account.get('username', '')
+    password = account.get('password', '')
 
-        # 座位号(seats)查表转换为座位ID(seat_ids)，确定最终预约的座位
-        params['seat_ids'] = resolve_final_seats(account, defaults)
+    if not username or not password:
+        reason = '缺少 username 或 password'
+        print(f"跳过第 {index} 个账号: {reason}")
+        return {'username': username, 'skipped': True, 'skip_reason': reason,
+                'stat': None, 'msg': '', 'seatid': None}
 
-        print(f"\n{'='*40}")
-        print(f"预约第 {i}/{len(accounts)} 个账号: {username}")
-        print(f"自习室:{params.get('room_id')} 开始:{params.get('begin')}:00 "
-              f"时长:{params.get('duration')}h 座位:{params.get('seat_ids') or '随机'}")
-        print(f"{'='*40}")
+    # 停用开关（所有加载路径统一生效，未配置 enabled 默认为启用）
+    if account.get('enabled', True) is False:
+        reason = '已停用 (enabled=false)'
+        print(f"跳过第 {index} 个账号 {username}: {reason}")
+        return {'username': username, 'skipped': True, 'skip_reason': reason,
+                'stat': None, 'msg': '', 'seatid': None}
 
+    # 合并: 账号级覆盖 > 默认配置（排除 username/password/enabled 等非预约参数）
+    params = {**defaults, **{k: v for k, v in account.items()
+              if k not in ('username', 'password', 'enabled')}}
+
+    # 座位号(seats)查表转换为座位ID(seat_ids)，确定最终预约的座位
+    params['seat_ids'] = resolve_final_seats(account, defaults)
+
+    print(f"\n{'='*40}")
+    print(f"预约第 {index}/{total} 个账号: {username}")
+    print(f"自习室:{params.get('room_id')} 开始:{params.get('begin')}:00 "
+          f"时长:{params.get('duration')}h 座位:{params.get('seat_ids') or '随机'}")
+    print(f"{'='*40}")
+
+    try:
         stat, msg, seatid = appoint_zwulib(
             username, password,
             room_id=params.get('room_id'),
@@ -458,18 +487,85 @@ if __name__ == '__main__':
             duration=params.get('duration'),
             seat_ids=params.get('seat_ids'),
             cron_delta_minutes=params.get('cron-delta-minutes', 5),
-            max_retry=params.get('max-retry', 20),
+            max_retry=(params.get('max-retry', 20) if max_retry is None else max_retry),
+            probe_interval=params.get('retry-probe-interval', 30),
+            probe_count=params.get('retry-probe-count', 8),
+            rush_interval=params.get('retry-rush-interval', 3),
+            rush_duration=params.get('retry-rush-duration', 60),
+            dry_run=_is_dry_run(),
         )
+    except Exception as e:
+        # 单账号异常只影响它自己，后续账号照常处理（并补发失败通知）
+        print(f"账号 {username} 执行异常: {e.__class__.__name__}: {e}")
+        stat, msg, seatid = 'fail', _friendly_error(e), None
 
-        # 预约后通知
-        if stat == "ok":
-            try:
-                notify(username, params.get('dday', 2), seatid, params)
-            except Exception as e:
-                print(f"通知发送失败: {e}")
-        else:
-            # 预约失败，发送失败原因
-            try:
-                notify_fail(username, msg, params)
-            except Exception as e:
-                print(f"失败通知发送失败: {e}")
+    if _is_dry_run():
+        # DRY RUN 绝不发通知，否则会收到"预约成功"的假消息
+        print(f"[dry-run] {username} 登录链路"
+              + ("正常" if stat == 'ok' else f"失败: {msg}"))
+    elif stat == "ok":
+        # 预约成功通知
+        try:
+            notify(username, params.get('dday', 2), seatid, params)
+        except Exception as e:
+            print(f"通知发送失败: {e}")
+    else:
+        # 预约失败，发送失败原因
+        try:
+            notify_fail(username, msg, params)
+        except Exception as e:
+            print(f"失败通知发送失败: {e}")
+
+    return {'username': username, 'skipped': False, 'skip_reason': '',
+            'stat': stat, 'msg': msg, 'seatid': seatid}
+
+
+def print_summary(results, dry_run=False):
+    """跑完后的总账，避免出现「某个账号静默消失」时无从察觉"""
+    ok = [r for r in results if r['stat'] == 'ok']
+    failed = [r for r in results if not r['skipped'] and r['stat'] != 'ok']
+    skipped = [r for r in results if r['skipped']]
+
+    print(f"\n{'='*40}")
+    if dry_run:
+        print(f"DRY RUN 汇总: {len(ok)} 登录成功 / {len(failed)} 失败 / "
+              f"{len(skipped)} 跳过 (共 {len(results)} 个账号)")
+    else:
+        print(f"汇总: {len(ok)} 成功 / {len(failed)} 失败 / {len(skipped)} 跳过 "
+              f"(共 {len(results)} 个账号)")
+    for r in failed:
+        print(f"  失败: {r['username']} - {r['msg']}")
+    for r in skipped:
+        print(f"  跳过: {r['username']} - {r['skip_reason']}")
+    if dry_run:
+        print("  本次未发起任何预约请求，也未发送通知")
+    print('='*40)
+
+
+def main():
+    accounts = load_accounts()
+    defaults = load_booking_config()
+    dry_run = _is_dry_run()
+
+    if not accounts:
+        print("无账号配置，退出")
+        exit(1)
+
+    if dry_run:
+        print("=" * 40)
+        print("DRY RUN 模式：只验证登录，不发起任何预约请求（不会占座、不发通知）")
+        print("=" * 40)
+
+    print(f"共 {len(accounts)} 个账号待处理")
+
+    total = len(accounts)
+    t_start = time.monotonic()
+    results = [process_account(i, total, account, defaults)
+               for i, account in enumerate(accounts, 1)]
+
+    print_summary(results, dry_run)
+    print(f"[timer] 全部账号处理完毕，总耗时 {time.monotonic() - t_start:.2f}s")
+
+
+if __name__ == '__main__':
+    main()

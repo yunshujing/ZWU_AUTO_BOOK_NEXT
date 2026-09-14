@@ -149,6 +149,7 @@ def update_chromedriver():
         
         # 备份旧的驱动
         drivers_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drivers')
+        os.makedirs(drivers_dir, exist_ok=True)  # drivers/ 不在仓库里，首次运行需要创建
         old_driver = os.path.join(drivers_dir, 'chromedriver.exe')
         
         if os.path.exists(old_driver):

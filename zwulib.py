@@ -4,17 +4,43 @@ import random
 from datetime import datetime, timedelta
 import json
 import os
+from contextlib import contextmanager
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.wait import WebDriverWait
+from selenium.common.exceptions import TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 import time
 import pandas as pd
 
 REQUEST_TIMEOUT = 30  # HTTP请求超时时间（秒）
+
+# 重试节奏：程序可能比系统开放时刻早启动，所以先「探路」（间隔大），
+# 之后转「猛攻」（间隔小）抢开抢瞬间。全程不依赖当前时钟。
+DEFAULT_PROBE_INTERVAL = 30  # 探路间隔（秒）
+DEFAULT_PROBE_COUNT = 8      # 探路次数上限
+DEFAULT_RUSH_INTERVAL = 3    # 猛攻间隔（秒）
+DEFAULT_RUSH_DURATION = 60   # 猛攻持续时长（秒），用于换算猛攻次数
+CANDIDATE_SEAT_INTERVAL = 2  # 同一账号尝试下一个候选座位的间隔（秒）
+
+
+@contextmanager
+def _stage(stages, name):
+    """记录一个阶段的耗时并追加到 stages 列表（异常时同样记录）"""
+    start = time.monotonic()
+    try:
+        yield
+    finally:
+        stages.append((name, time.monotonic() - start))
+
+
+def _log_timer(username, stages, total):
+    """打印分阶段耗时，用于定位瓶颈（优化效果的量化依据）"""
+    detail = ' '.join(f"{name}={cost:.2f}s" for name, cost in stages)
+    print(f"[timer] user={username} {detail} 合计={total:.2f}s")
 
 # 自习室编号 -> 名称
 ROOM_NAMES = ['自习室112', '自习室113', '自习室114', '自习室212', '自习室213', '自习室214', '自习室312', '自习室313', '自习室314']
@@ -75,27 +101,58 @@ class SeatAutoBooker:
         delta = book_time - start_beijing
         return int(delta.total_seconds())
 
-    def book_favorite_seat(self, dday, start_hour, duration, cron_delta_minutes=5, max_retry=20):
+    @staticmethod
+    def _retry_intervals(max_retry, probe_interval, probe_count,
+                         rush_interval, rush_duration):
         """
-        在预约时间窗口内循环重试预约座位
+        生成每次尝试前的等待间隔：前 probe_count 次走探路间隔，之后走猛攻间隔。
+        最后一次尝试后不再等待。返回长度不超过 max_retry 的列表。
+
+        例（默认值）：8 次 × 30s + 12 次 × 3s ≈ 4.6 分钟，而旧的固定 60s × 20 次是 20 分钟。
+        """
+        max_retry = max(1, int(max_retry))
+        probe_count = max(0, min(int(probe_count), max_retry))
+
+        intervals = [max(0, probe_interval)] * probe_count
+
+        remaining = max_retry - probe_count
+        if remaining > 0 and rush_interval > 0:
+            rush_slots = max(1, int(rush_duration // rush_interval))
+            intervals.extend([rush_interval] * min(remaining, rush_slots))
+
+        if not intervals:
+            intervals = [0]
+
+        intervals[-1] = 0  # 最后一次不再等待
+        return intervals
+
+    def book_favorite_seat(self, dday, start_hour, duration, cron_delta_minutes=5,
+                           max_retry=20, probe_interval=DEFAULT_PROBE_INTERVAL,
+                           probe_count=DEFAULT_PROBE_COUNT,
+                           rush_interval=DEFAULT_RUSH_INTERVAL,
+                           rush_duration=DEFAULT_RUSH_DURATION):
+        """
+        在预约时间窗口内按「探路 → 猛攻」节奏重试预约座位
 
         参数:
             dday: 延后天数
             start_hour: 开始时间小时
             duration: 持续时长
-            cron_delta_minutes: 提前几分钟开始尝试
-            max_retry: 最大重试次数
+            cron_delta_minutes: 已废弃，保留仅为兼容旧调用
+            max_retry: 最大尝试次数
+            probe_interval: 探路间隔（秒），程序可能早于系统开放时刻启动
+            probe_count: 探路次数上限
+            rush_interval: 猛攻间隔（秒）
+            rush_duration: 猛攻持续时长（秒）
         """
-        # 防止无效参数
-        max_retry = max(max_retry, 3)
-
         total_seconds = self._calc_total_seconds(dday, start_hour)
-        retry_interval = 60  # 重试间隔60秒
+        intervals = self._retry_intervals(max_retry, probe_interval, probe_count,
+                                          rush_interval, rush_duration)
 
         stat, msg, seatid = 'fail', '未尝试', None
-        for attempt in range(max_retry):
+        for attempt, interval in enumerate(intervals):
             try:
-                print(f"\n--- 第 {attempt + 1}/{max_retry} 次尝试 ---")
+                print(f"\n--- 第 {attempt + 1}/{len(intervals)} 次尝试 ---")
 
                 # 如果指定了座位ID，直接预约
                 if self.seat_ids:
@@ -107,12 +164,14 @@ class SeatAutoBooker:
                 if stat == "ok" or '请勿重复预约' in msg:
                     return stat, msg, seatid
 
-                print(f"预约失败: {msg}，{retry_interval}秒后重试...")
-                time.sleep(retry_interval)
+                if interval > 0:
+                    print(f"预约失败: {msg}，{interval}秒后重试...")
+                    time.sleep(interval)
 
             except Exception as e:
                 print(f"第 {attempt + 1} 次尝试异常: {e.__class__.__name__}: {e}")
-                time.sleep(retry_interval)
+                if interval > 0:
+                    time.sleep(interval)
 
         # 所有重试用完
         return stat, msg, seatid
@@ -175,7 +234,7 @@ class SeatAutoBooker:
             if code == "ok":
                 return "ok", f"预约成功 座位:{seat_id}", seat_id
 
-            time.sleep(5)  # 避免请求太频繁
+            time.sleep(CANDIDATE_SEAT_INTERVAL)  # 避免请求太频繁
 
         # 所有座位都试过了，返回最后一个结果
         return code, msg, seat_id
@@ -187,9 +246,8 @@ class SeatAutoBooker:
 
         try:
             self.driver.get("https://zjwu.huitu.zhishulib.com/")
-            time.sleep(3)
 
-            # 找到用户名输入框
+            # 找到用户名输入框（wait.until 本身就在等页面就绪，无需额外固定等待）
             self.wait.until(EC.presence_of_element_located((By.NAME, "login_name")))
             self.driver.find_element(By.NAME, 'login_name').clear()
             self.driver.find_element(By.NAME, 'login_name').send_keys(self.un)
@@ -202,7 +260,13 @@ class SeatAutoBooker:
             # 找到登录按钮并点击
             self.wait.until(EC.presence_of_element_located((By.XPATH, button_path_selector)))
             self.driver.find_element(By.XPATH, button_path_selector).click()
-            time.sleep(8)
+
+            # 等跳出登录页，而不是固定睡 8 秒。
+            # 站点若改成不更换 URL 的路由方式，可设 LOGIN_WAIT_MODE=fixed 回退到旧的固定等待。
+            if os.environ.get('LOGIN_WAIT_MODE', 'url').lower() == 'fixed':
+                time.sleep(8)
+            else:
+                self.wait.until(lambda d: 'login' not in (d.current_url or '').lower())
 
             # 提取cookies
             cookie_list = self.driver.get_cookies()
@@ -215,8 +279,13 @@ class SeatAutoBooker:
                 print("登录可能失败，URL仍为登录页")
                 return -1
 
+        except TimeoutException:
+            print("登录超时，仍未跳出登录页")
+            return -1
         except Exception as e:
-            print(e.__class__.__name__ + "无法登录")
+            # 带上真实原因，否则一旦环境/站点变化，排查只能靠猜
+            detail = ' '.join(str(e).split())[:200]
+            print(f"登录异常（{e.__class__.__name__}）: {detail}")
             return -1
         return 0
 
@@ -236,23 +305,50 @@ class SeatAutoBooker:
         return 0
 
 
-def appoint_zwulib(username, password, room_id=3, dday=1, begin=8, duration=13,
-                    seat_ids=None, cron_delta_minutes=5, max_retry=20):
+def appoint_zwulib(username, password, room_id=2, dday=2, begin=12, duration=9,
+                   seat_ids=None, cron_delta_minutes=5, max_retry=20,
+                   probe_interval=DEFAULT_PROBE_INTERVAL,
+                   probe_count=DEFAULT_PROBE_COUNT,
+                   rush_interval=DEFAULT_RUSH_INTERVAL,
+                   rush_duration=DEFAULT_RUSH_DURATION,
+                   dry_run=False):
     """
     预约图书馆座位（带时间窗口和重试）
 
+    dry_run=True 时只走「启动浏览器 → 登录 → 取 UID」就返回，
+    不发起任何预约请求，用于安全地验证登录链路与采集耗时（不会占座）。
+
     返回: (stat, msg, seatid)
     """
-    s = SeatAutoBooker(username, password, room_id, seat_ids)
-    try:
-        if s.login() != 0:
-            return 'fail', '登录失败', None
-        if s.get_user_info() != 0:
-            return 'fail', '获取用户信息失败', None
+    t_start = time.monotonic()
+    stages = []
+    s = None
 
-        stat, msg, seatid = s.book_favorite_seat(dday, begin, duration,
-                                                  cron_delta_minutes, max_retry)
+    try:
+        # 构造失败（如 Chrome 启动不了）时异常抛给上层，分阶段日志由 finally 统一打印
+        with _stage(stages, '启动'):
+            s = SeatAutoBooker(username, password, room_id, seat_ids)
+
+        with _stage(stages, '登录'):
+            if s.login() != 0:
+                return 'fail', '登录失败', None
+
+        with _stage(stages, '取UID'):
+            if s.get_user_info() != 0:
+                return 'fail', '获取用户信息失败', None
+
+        if dry_run:
+            print("DRY RUN: 登录成功，跳过预约（未发起任何预约请求）")
+            return 'ok', 'DRY RUN: 登录成功，未发起预约', None
+
+        with _stage(stages, '抢座'):
+            stat, msg, seatid = s.book_favorite_seat(
+                dday, begin, duration, cron_delta_minutes, max_retry,
+                probe_interval, probe_count, rush_interval, rush_duration)
         print(stat, msg)
         return stat, msg, seatid
     finally:
-        s.driver.quit()
+        if s is not None:
+            with _stage(stages, '收尾'):
+                s.driver.quit()
+        _log_timer(username, stages, time.monotonic() - t_start)

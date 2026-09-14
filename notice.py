@@ -7,23 +7,9 @@ from email.mime.text import MIMEText
 from email.utils import formataddr
 from datetime import datetime, timedelta, timezone
 
+from seatmap import get_seat_info
+
 BEIJING_TZ = timezone(timedelta(hours=8))
-
-
-def get_seat_info(seatid):
-    """获取座位信息（返回字典，值为标量）"""
-    try:
-        import pandas as pd
-        import os
-        xlsx_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'zwu_lib.xlsx')
-        df = pd.read_excel(xlsx_path, index_col=0)
-        matched = df[df['id'] == int(seatid)]
-        if matched.empty:
-            return {'room': '未知', 'title': str(seatid), 'id': str(seatid)}
-        row = matched.iloc[0]
-        return {'room': str(row['room']), 'title': str(row['title']), 'id': str(row['id'])}
-    except Exception:
-        return {'room': '未知', 'title': str(seatid), 'id': str(seatid)}
 
 
 def notify(user, dday, seatid, config=None):
@@ -69,7 +55,7 @@ def notify_fail(user, reason, config=None):
 
     title = f"预约失败 | {user}"
     content = (
-        f"**万鲤座位管家**\n\n"
+        f"**ZWU图书馆助手**\n\n"
         f"- 用户: {user}\n"
         f"- 状态: ❌ 预约失败\n"
         f"- 原因: {reason}\n"
@@ -102,7 +88,7 @@ def _send_wechat(user, dday, seatid, config):
 
     title = f"预约成功 | {user}"
     content = (
-        f"**万鲤座位管家**\n\n"
+        f"**ZWU图书馆助手**\n\n"
         f"- 日期: {actual_date}（{weekday}）\n"
         f"- 时间: {begin}:00 ~ {int(begin) + int(duration)}:00\n"
         f"- 持续时长: {duration}h\n"
