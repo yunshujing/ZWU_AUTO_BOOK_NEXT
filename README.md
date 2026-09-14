@@ -482,7 +482,7 @@ https://api.github.com/repos/你的用户名/ZWU_AUTO_BOOK_NEXT/actions/workflow
 | `retry-probe-count`  | int | 8              | 探路次数上限                    |
 | `retry-rush-interval` | int | 3             | 猛攻间隔（秒），系统开放后全力抢 |
 | `retry-rush-duration` | int | 60            | 猛攻持续时长（秒）              |
-| `concurrency`        | int | 3              | 抢座阶段的并发账号数。`1` = 挨个发请求（最保守），`3` = 三个一批（推荐） |
+| `concurrency`        | int | 1              | 抢座阶段的并发账号数。`1` = 挨个发请求（默认，最保守），`3` = 三个一批 |
 | `concurrency-jitter` | float | 0.8          | 并发时各账号出手的随机错开上限（秒），`0` = 不错开 |
 | `cron-delta-minutes` | int | 5              | ⚠️ 已废弃，脚本启动后直接预约 |
 | `max-retry`          | int | 20             | 最大尝试次数上限                |
@@ -496,27 +496,27 @@ https://api.github.com/repos/你的用户名/ZWU_AUTO_BOOK_NEXT/actions/workflow
 > [!IMPORTANT]
 > **两阶段抢座**：程序先逐个账号登录并拿到「轻量会话」（浏览器随之关闭），
 > 之后**只发 HTTP 请求**抢座，并按 `concurrency` 分批并发。
-> 这样慢活（登录）不占用抢座窗口 —— 实测 14 个账号的出手时间从 **约 118 秒压缩到约 5 秒**。
-> 把 `concurrency` 设为 `1` 即恢复为挨个发请求（请求特征与旧版一致）。
+> 这样慢活（登录）不占用抢座窗口 —— 登录约占单账号 78% 的耗时，前置后 14 个账号的出手时间可从 **约 118 秒压缩到约 5 秒**。
+> 默认 `concurrency: 1`（完全串行），需要提速时再调大。
 
 > [!WARNING]
 > **关于并发与风控**：并发会让同一出口 IP 在短时间内出现多个账号的请求。
 > 账号之间的**隔离**已在代码层保证并被测试覆盖（每个账号独立 Cookie、独立请求头、独立连接，绝不串号）；
 > 但「短时间内多个请求」这一**流量特征本身**无法用代码消除，只能靠降低并发或错开时间来弱化。
 >
-> 保守程度由低到高：
+> **请按以下顺序上线，一次只引入一个新变量：**
 >
-> | 配置 | 14 个账号出手耗时 | 请求特征 |
-> | --- | --- | --- |
-> | `concurrency: 1` | ~14 秒 | **与旧版完全一致，无任何并发** |
-> | `concurrency: 3` + `concurrency-jitter: 0.8` | ~5 秒 | 3 个请求重叠，但落在 0~0.8 秒的不同时刻（默认） |
-> | `concurrency: 3` + `concurrency-jitter: 0` | ~5 秒 | 3 个请求几乎同一瞬间（**最激进，不建议**） |
+> | 步骤 | 配置 | 14 账号出手耗时 | 说明 |
+> | --- | --- | --- | --- |
+> | ① 先保持默认 | `concurrency: 1` | ~14 秒 | **与旧版完全一致，零并发**。用于验证两阶段调度与「登录→抢座」间隔后会话是否仍有效 |
+> | ② 确认无误后 | `concurrency: 3` | ~5 秒 | 3 个请求重叠，并由 `concurrency-jitter` 错开到 0~0.8 秒的不同时刻 |
+> | 不建议 | `concurrency: 3` + `concurrency-jitter: 0` | ~5 秒 | 3 个请求几乎同一瞬间，流量特征最激进 |
 >
-> **建议**：首次使用并发时先设 `concurrency: 1` 跑通整条链路，确认无误后再调到 `3`。
+> 出现任何异常，把 `concurrency` 改回 `1` 即可退回最保守状态，**无需改动代码**。
 
 > [!NOTE]
-> **本项目已支持账号级参数覆盖**（`room_id` / `begin` / `seats` / `max-retry` 等），
-> 但 `concurrency` 与 `concurrency-jitter` 是**全局设置**，只能配在 `booking_config.yml`。
+> `concurrency` 与 `concurrency-jitter` 是**全局设置**，只能配在 `booking_config.yml`，
+> 不支持账号级覆盖（其余如 `room_id` / `begin` / `seats` / `max-retry` 均可按账号覆盖）。
 
 > [!NOTE]
 > **环境变量 `LOGIN_WAIT_MODE`**（可选）：默认 `url`，登录后等待 URL 跳出登录页即继续。
