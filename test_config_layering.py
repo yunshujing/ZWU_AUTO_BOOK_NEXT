@@ -10,10 +10,12 @@ Run: python test_config_layering.py
 """
 import json
 import os
+import re
 import sys
 import io
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -891,6 +893,67 @@ def test_22_two_phase_login_before_booking():
     print("[PASS] all logins precede bookings; concurrency respected (max %d)" % live['max'])
 
 
+def test_23_concurrent_sessions_never_share_cookies():
+    print("\n" + "=" * 60)
+    print("Test 23: concurrent sessions keep their own Cookie (no cross-talk)")
+    print("=" * 60)
+    import zwulib
+
+    N = 5
+    lock = threading.Lock()
+    seen = []
+    start_gate = threading.Barrier(N)  # 让 N 个线程尽量同时开抢
+
+    class FakeResp:
+        def __init__(self, payload):
+            self._p = payload
+            self.text = json.dumps(payload)
+
+        def json(self):
+            return self._p
+
+    def fake_post(url, data=None, headers=None, timeout=None, **kwargs):
+        m = re.search(r'seatBookers\[0\]=(\d+)', data or '')
+        with lock:
+            seen.append({'cookie': (headers or {}).get('Cookie'),
+                         'uid': m.group(1) if m else None})
+        return FakeResp({'CODE': 'ok', 'MESSAGE': 'mock'})
+
+    def run(sess):
+        start_gate.wait(timeout=10)
+        return sess.book(2, 9, 12, seat_ids=[13263], max_retry=1)
+
+    real_post = zwulib.requests.post
+    zwulib.requests.post = fake_post
+    try:
+        sessions = [zwulib.SeatSession('u%d' % i, 'cookie-u%d' % i, 1000 + i, 2)
+                    for i in range(1, N + 1)]
+        with ThreadPoolExecutor(max_workers=N) as pool:
+            results = list(pool.map(run, sessions))
+    finally:
+        zwulib.requests.post = real_post
+
+    assert len(seen) == N, "expected %d booking requests, got %d" % (N, len(seen))
+    assert all(r[0] == 'ok' for r in results), \
+        "all mock bookings should succeed, got %s" % results
+
+    # 核心断言：每个 Cookie 只能配对自己那个 uid，绝不能串号
+    pairs = {s['cookie']: s['uid'] for s in seen}
+    assert len(pairs) == N, \
+        "each session must send a distinct cookie, got %s" % sorted(pairs)
+    for i in range(1, N + 1):
+        got = pairs.get('cookie-u%d' % i)
+        assert got == str(1000 + i), \
+            "cookie-u%d must carry uid %d, got %s (all=%s)" % (i, 1000 + i, got, pairs)
+
+    # 每个会话必须持有各自独立的 headers 对象（共用会导致 Cookie 被互相覆盖）
+    assert len({id(s.headers) for s in sessions}) == N, \
+        "each session must own a separate headers dict"
+    uids = [s.user_data['uid'] for s in sessions]
+    assert uids == [1001, 1002, 1003, 1004, 1005], "session uids must not mix up: %s" % uids
+    print("[PASS] %d concurrent sessions: cookies/uids stayed paired, headers isolated" % N)
+
+
 if __name__ == '__main__':
     tests = [
         test_1_old_accounts_compat,
@@ -915,6 +978,7 @@ if __name__ == '__main__':
         test_20_dry_run_sends_no_notification,
         test_21_appoint_dry_run_skips_booking,
         test_22_two_phase_login_before_booking,
+        test_23_concurrent_sessions_never_share_cookies,
     ]
     passed, failed = 0, 0
     try:

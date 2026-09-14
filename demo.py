@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import time
 import yaml
 import requests
@@ -30,6 +31,7 @@ DEFAULTS = {
     'retry-rush-interval': 3,     # 猛攻间隔（秒）
     'retry-rush-duration': 60,    # 猛攻持续时长（秒）
     'concurrency': 3,             # 抢座阶段的并发账号数（1 = 挨个发，最保守）
+    'concurrency-jitter': 0.8,    # 并发时各账号出手的随机错开上限（秒），0 = 不错开
     'notification_type': 'none',
     'sckey': '',
     'smtp': {},
@@ -429,6 +431,18 @@ def _is_dry_run():
     return os.environ.get('DRY_RUN', '').strip().lower() in ('1', 'true', 'yes', 'on')
 
 
+def _jitter_seconds(defaults):
+    """
+    抢座出手的随机错开上限（秒）；0 表示不错开。
+
+    目的是让并发账号的请求在时间上散开，而不是集中落在同一瞬间。
+    """
+    try:
+        return max(0.0, float(defaults.get('concurrency-jitter', 0.8)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _friendly_error(exc):
     """把异常翻译成适合写进通知的人话（完整报错仍留在运行日志里）"""
     name = exc.__class__.__name__
@@ -552,9 +566,20 @@ def book_session(session, params, max_retry=None):
     )
 
 
-def book_one(result, max_retry=None):
-    """阶段二单账号：抢座 → 立即通知。就地更新 result 并返回它。"""
+def book_one(result, max_retry=None, jitter=0.0):
+    """
+    阶段二单账号：抢座 → 立即通知。就地更新 result 并返回它。
+
+    jitter（秒）> 0 时先随机等待 0~jitter 再出手。并发只让 3 个请求重叠，
+    错开抖动则避免它们落在同一瞬间 —— 时间上散开比"完全同时"更像真人行为。
+    """
     username = result['username']
+
+    if jitter > 0:
+        delay = random.uniform(0, jitter)
+        print(f"[隔离] {username} 随机错开 {delay:.2f}s 后出手")
+        time.sleep(delay)
+
     try:
         stat, msg, seatid = book_session(result['session'], result['params'], max_retry)
     except Exception as e:
@@ -618,12 +643,15 @@ def run_all(accounts, defaults, concurrency=1):
         return results
 
     workers = max(1, int(concurrency))
+    # 并发 > 1 时把各账号的出手时刻随机错开；串行时无需错开
+    jitter = _jitter_seconds(defaults) if workers > 1 else 0.0
+    suffix = f"，随机错开 0~{jitter:g}s" if jitter > 0 else ""
     print(f"\n登录完成：{len(ready)}/{total} 个账号拿到会话，"
-          f"开始抢座（并发 {workers}）")
+          f"开始抢座（并发 {workers}{suffix}）")
     t_start = time.monotonic()
     try:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(book_one, ready))
+            list(pool.map(lambda r: book_one(r, jitter=jitter), ready))
     finally:
         print(f"[timer] 抢座阶段结束，耗时 {time.monotonic() - t_start:.2f}s")
     return results
