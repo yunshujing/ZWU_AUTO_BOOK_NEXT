@@ -3,7 +3,8 @@
 Config layering test script.
 
 Verifies load_accounts() priority branches, _load_accounts_split() merge logic,
-and main-loop enabled skip. Does NOT trigger real booking (mocks appoint_zwulib).
+the two-phase scheduler (login-then-book), DRY RUN safety, and main-loop enabled skip.
+Does NOT trigger real booking (only open_session is mocked).
 
 Run: python test_config_layering.py
 """
@@ -11,6 +12,8 @@ import json
 import os
 import sys
 import io
+import threading
+import time
 from contextlib import redirect_stdout
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -24,43 +27,66 @@ def _reload_demo():
     return demo
 
 
-def _run_main_loop_ex(demo):
-    """Drive the REAL production loop (demo.process_account) with mocked booking.
+def _run_main_loop_ex(demo, fail_on=None, book_fail_on=None, notify=None, notify_fail=None):
+    """Drive the REAL production scheduler (demo.run_all), replacing only open_session.
 
-    Returns (processed, output, results). Keep this delegating to demo.process_account
-    instead of copying the loop here — a copied loop would keep passing after demo.py
-    changes, which is exactly the regression we need to catch.
+    Nothing here touches the network, launches a browser, or books a seat: the fake
+    session stands in for the logged-in state. Keep delegating to the real scheduler —
+    a copied loop would keep passing after demo.py changes, which is the regression we
+    need to catch.
+
+    Returns dict: {'processed', 'booked', 'results', 'output'}
+      booked 只包含真正进入抢座的账号 —— 用它可以直接断言"没有抢座"。
     """
-    processed = []
+    seen = []      # open_session 收到的 (username, password, room_id)
+    booked = {}    # username -> 实际传给抢座的参数
 
-    def fake_appoint(username, password, **kwargs):
-        processed.append({
-            'username': username,
-            'password': password,
-            'room_id': kwargs.get('room_id'),
-            'begin': kwargs.get('begin'),
-            'seat_ids': kwargs.get('seat_ids'),
-        })
-        return 'ok', 'mock success', 12920
+    class FakeSession:
+        def __init__(self, username):
+            self.username = username
 
-    demo.appoint_zwulib = fake_appoint
-    demo.notify = lambda *a, **k: None
-    demo.notify_fail = lambda *a, **k: None
+        def book(self, dday, start_hour, duration, **kwargs):
+            booked[self.username] = {'dday': dday, 'begin': start_hour,
+                                     'duration': duration, **kwargs}
+            if book_fail_on and self.username == book_fail_on:
+                return 'fail', '无可用座位', None
+            return 'ok', 'mock success', 12920
+
+    def fake_open_session(username, password, room_id):
+        if fail_on and username == fail_on:
+            raise RuntimeError("chrome failed to start")  # 模拟浏览器启动失败
+        seen.append((username, password, room_id))
+        return FakeSession(username), None
+
+    demo.open_session = fake_open_session
+    demo.notify = notify or (lambda *a, **k: None)
+    demo.notify_fail = notify_fail or (lambda *a, **k: None)
 
     f = io.StringIO()
     with redirect_stdout(f):
         accounts = demo.load_accounts()
         defaults = demo.load_booking_config()
-        total = len(accounts)
-        results = [demo.process_account(i, total, account, defaults)
-                   for i, account in enumerate(accounts, 1)]
-    return processed, f.getvalue(), results
+        results = demo.run_all(accounts, defaults, concurrency=1)
+        demo.print_summary(results, demo._is_dry_run())
+    output = f.getvalue()
+
+    processed = []
+    for username, password, room_id in seen:
+        call = booked.get(username, {})
+        processed.append({
+            'username': username,
+            'password': password,
+            'room_id': room_id,
+            'begin': call.get('begin'),
+            'seat_ids': call.get('seat_ids'),
+        })
+    return {'processed': processed, 'booked': booked, 'results': results, 'output': output}
 
 
 def _run_main_loop(demo):
     """Backward-compatible wrapper returning (processed, output)."""
-    processed, output, _ = _run_main_loop_ex(demo)
-    return processed, output
+    r = _run_main_loop_ex(demo)
+    return r['processed'], r['output']
 
 
 _ACCOUNTS_BACKUP = ACCOUNTS_FILE + '.testhidden'
@@ -245,26 +271,14 @@ def test_8_enabled_field_not_in_params():
     ])
     os.environ['PASSWORDS'] = json.dumps({"user1": "p1"})
     demo = _reload_demo()
-    captured = {}
+    r = _run_main_loop_ex(demo)
 
-    def fake_appoint(username, password, **kwargs):
-        captured.update(kwargs)
-        return 'ok', 'mock', 12920
-
-    demo.appoint_zwulib = fake_appoint
-    demo.notify = lambda *a, **k: None
-    demo.notify_fail = lambda *a, **k: None
-
-    f = io.StringIO()
-    with redirect_stdout(f):
-        accounts = demo.load_accounts()
-        defaults = demo.load_booking_config()
-        total = len(accounts)
-        for i, account in enumerate(accounts, 1):
-            demo.process_account(i, total, account, defaults)
-
-    assert 'enabled' not in captured, "enabled should not be in params, got: %s" % list(captured.keys())
-    assert captured.get('room_id') == 3
+    assert len(r['results']) == 1, "expected 1 account, got %d" % len(r['results'])
+    params = r['results'][0]['params']
+    assert 'enabled' not in params, \
+        "enabled must not leak into params, got: %s" % sorted(params.keys())
+    assert params.get('room_id') == 3
+    assert r['processed'][0]['room_id'] == 3, "resolved room_id must reach the session"
     print("[PASS] enabled field properly excluded from params")
 
 
@@ -667,47 +681,32 @@ def test_18_account_exception_isolation():
         {"boom_user": "p1", "good_user": "p2", "after_user": "p3"})
     demo = _reload_demo()
 
-    attempted = []
     notified = []
-    failed_notices = []
+    failures = []
+    r = _run_main_loop_ex(
+        demo, fail_on='boom_user',
+        notify=lambda user, *a, **k: notified.append(user),
+        notify_fail=lambda user, reason, *a, **k: failures.append((user, reason)))
 
-    def fake_appoint(username, password, **kwargs):
-        attempted.append(username)
-        if username == 'boom_user':
-            raise RuntimeError("chrome failed to start")  # 模拟浏览器启动失败
-        return 'ok', 'mock success', 12920
+    # 核心断言：出错账号之后的账号仍然被登录（旧实现在这里会整批中断）
+    assert [p['username'] for p in r['processed']] == ['good_user', 'after_user'], \
+        "accounts after the failing one must still be attempted, got %s" % r['processed']
 
-    demo.appoint_zwulib = fake_appoint
-    demo.notify = lambda user, *a, **k: notified.append(user)
-    demo.notify_fail = lambda user, reason, *a, **k: failed_notices.append((user, reason))
-
-    f = io.StringIO()
-    with redirect_stdout(f):
-        accounts = demo.load_accounts()
-        defaults = demo.load_booking_config()
-        total = len(accounts)
-        results = [demo.process_account(i, total, account, defaults)
-                   for i, account in enumerate(accounts, 1)]
-
-    # 核心断言：出错账号之后的账号仍被执行（旧实现在这里会整批中断）
-    assert attempted == ['boom_user', 'good_user', 'after_user'], \
-        "all accounts must be attempted, got %s" % attempted
-
-    by_name = {r['username']: r for r in results}
+    by_name = {x['username']: x for x in r['results']}
     assert by_name['boom_user']['stat'] == 'fail', "failing account should be marked fail"
     assert by_name['good_user']['stat'] == 'ok'
     assert by_name['after_user']['stat'] == 'ok'
 
     # 出错账号必须收到失败通知，不能静默消失
-    assert len(failed_notices) == 1, \
-        "failing account should still be notified, got %s" % failed_notices
-    assert failed_notices[0][0] == 'boom_user'
+    assert len(failures) == 1, \
+        "failing account should still be notified, got %s" % failures
+    assert failures[0][0] == 'boom_user'
     assert notified == ['good_user', 'after_user'], \
         "successful accounts must still be notified, got %s" % notified
 
     # 通知里应该是人话，而不是异常原文
-    assert 'chrome' not in failed_notices[0][1].lower(), \
-        "raw exception text must not leak into the notice, got %s" % failed_notices[0][1]
+    assert 'chrome' not in failures[0][1].lower(), \
+        "raw exception text must not leak into the notice, got %s" % failures[0][1]
     print("[PASS] exception isolated to its own account; every account still notified")
 
 
@@ -725,25 +724,7 @@ def test_19_summary_reports_every_account():
     os.environ['PASSWORDS'] = json.dumps(
         {"ok_user": "p1", "fail_user": "p2", "off_user": "p3"})
     demo = _reload_demo()
-
-    def fake_appoint(username, password, **kwargs):
-        if username == 'fail_user':
-            return 'fail', '无可用座位', None
-        return 'ok', 'mock success', 12920
-
-    demo.appoint_zwulib = fake_appoint
-    demo.notify = lambda *a, **k: None
-    demo.notify_fail = lambda *a, **k: None
-
-    f = io.StringIO()
-    with redirect_stdout(f):
-        accounts = demo.load_accounts()
-        defaults = demo.load_booking_config()
-        total = len(accounts)
-        results = [demo.process_account(i, total, account, defaults)
-                   for i, account in enumerate(accounts, 1)]
-        demo.print_summary(results)
-    output = f.getvalue()
+    output = _run_main_loop_ex(demo, book_fail_on='fail_user')['output']
 
     assert "1 成功 / 1 失败 / 1 跳过" in output, "summary counts wrong:\n%s" % output
     assert 'fail_user' in output and '无可用座位' in output, "failure reason must be listed"
@@ -768,44 +749,28 @@ def test_20_dry_run_sends_no_notification():
         assert demo._is_dry_run() is False, "DRY_RUN=%r must not enable dry run" % falsy
     os.environ['DRY_RUN'] = '1'
 
-    booked = []
     notices = []
     failures = []
+    collect = dict(notify=lambda *a, **k: notices.append(a),
+                   notify_fail=lambda *a, **k: failures.append(a))
+    r = _run_main_loop_ex(demo, **collect)
 
-    def fake_appoint(username, password, **kwargs):
-        booked.append(kwargs.get('dry_run'))
-        return 'ok', 'DRY RUN: 登录成功，未发起预约', None
-
-    demo.appoint_zwulib = fake_appoint
-    demo.notify = lambda *a, **k: notices.append(a)
-    demo.notify_fail = lambda *a, **k: failures.append(a)
-
-    f = io.StringIO()
-    with redirect_stdout(f):
-        accounts = demo.load_accounts()
-        defaults = demo.load_booking_config()
-        total = len(accounts)
-        results = [demo.process_account(i, total, account, defaults)
-                   for i, account in enumerate(accounts, 1)]
-        demo.print_summary(results, dry_run=True)
-    output = f.getvalue()
-
-    assert booked == [True], \
-        "dry_run flag must reach appoint_zwulib, got %s" % booked
+    # 核心：DRY RUN 绝不进入抢座阶段（防误约的硬保险）
+    assert r['booked'] == {}, \
+        "DRY RUN MUST NOT reach the booking call, got %s" % r['booked']
+    assert r['processed'], "login must still happen (that is the whole point)"
     assert notices == [], \
         "DRY RUN must never send a success notice (would be a fake booking), got %s" % notices
-    assert 'DRY RUN' in output and '未发起任何预约请求' in output
+    assert failures == [], "DRY RUN must not send failure notices either"
+    assert 'DRY RUN' in r['output'] and '未发起任何预约请求' in r['output']
+    assert '[dry-run] dry_user 登录链路正常' in r['output']
 
     # 登录失败时同样不发通知，但要如实报告
-    demo.appoint_zwulib = lambda *a, **k: ('fail', '登录失败', None)
-    f2 = io.StringIO()
-    with redirect_stdout(f2):
-        r = demo.process_account(1, 1, {'username': 'dry_user', 'password': 'p1'},
-                                 demo.load_booking_config())
-    assert r['stat'] == 'fail'
+    r2 = _run_main_loop_ex(demo, fail_on='dry_user', **collect)
+    assert r2['results'][0]['stat'] == 'fail'
     assert failures == [], "DRY RUN must not send failure notices either"
-    assert '登录链路失败' in f2.getvalue(), "dry run must report the failure honestly"
-    print("[PASS] dry run forwards flag, sends no notice, reports honestly")
+    assert '登录链路失败' in r2['output'], "dry run must report the failure honestly"
+    print("[PASS] dry run never books, sends no notice, reports honestly")
 
 
 def test_21_appoint_dry_run_skips_booking():
@@ -815,6 +780,11 @@ def test_21_appoint_dry_run_skips_booking():
     import zwulib
 
     calls = {'login': 0, 'uid': 0, 'book': 0, 'quit': 0}
+
+    class FakeSession:
+        def book(self, *args, **kwargs):
+            calls['book'] += 1
+            return 'ok', 'should never happen in dry run', 12920
 
     class FakeBooker:
         """Stands in for SeatAutoBooker so no browser is launched."""
@@ -830,9 +800,8 @@ def test_21_appoint_dry_run_skips_booking():
             calls['uid'] += 1
             return 0
 
-        def book_favorite_seat(self, *args, **kwargs):
-            calls['book'] += 1
-            return 'ok', 'should never happen in dry run', 12920
+        def to_session(self):
+            return FakeSession()
 
         def quit(self):
             calls['quit'] += 1
@@ -850,10 +819,76 @@ def test_21_appoint_dry_run_skips_booking():
     assert calls['login'] == 1, "login must still run (that is the whole point)"
     assert calls['uid'] == 1, "uid lookup must still run to prove the session works"
     assert calls['book'] == 0, \
-        "DRY RUN MUST NOT call book_favorite_seat, got %d call(s)" % calls['book']
+        "DRY RUN MUST NOT reach the booking call, got %d call(s)" % calls['book']
     assert calls['quit'] == 1, "the browser must still be cleaned up"
     assert 'DRY RUN' in f.getvalue()
     print("[PASS] dry run stops before booking and still cleans up the browser")
+
+
+def test_22_two_phase_login_before_booking():
+    print("\n" + "=" * 60)
+    print("Test 22: every login finishes before the first booking; concurrency capped")
+    print("=" * 60)
+    _ensure_no_local_file()
+    _clean_env()
+    os.environ['ACCOUNTS_CONFIG'] = json.dumps(
+        [{"username": "u%d" % i} for i in range(1, 7)])
+    os.environ['PASSWORDS'] = json.dumps({"u%d" % i: "p" for i in range(1, 7)})
+    demo = _reload_demo()
+
+    events = []
+    live = {'n': 0, 'max': 0}
+    lock = threading.Lock()
+
+    class FakeSession:
+        def __init__(self, username):
+            self.username = username
+
+        def book(self, *args, **kwargs):
+            with lock:
+                live['n'] += 1
+                live['max'] = max(live['max'], live['n'])
+            try:
+                events.append(('book', self.username))
+                time.sleep(0.05)  # 模拟网络往返，给并发留出重叠窗口
+                return 'ok', 'mock success', 12920
+            finally:
+                with lock:
+                    live['n'] -= 1
+
+    def fake_open_session(username, password, room_id):
+        events.append(('login', username))
+        time.sleep(0.02)
+        return FakeSession(username), None
+
+    demo.open_session = fake_open_session
+    demo.notify = demo.notify_fail = lambda *a, **k: None
+
+    f = io.StringIO()
+    with redirect_stdout(f):
+        accounts = demo.load_accounts()
+        defaults = demo.load_booking_config()
+        demo.run_all(accounts, defaults, concurrency=3)
+    output = f.getvalue()
+
+    logins = [e for e in events if e[0] == 'login']
+    books = [e for e in events if e[0] == 'book']
+    assert len(logins) == 6, "expected 6 logins, got %d" % len(logins)
+    assert len(books) == 6, "expected 6 bookings, got %d" % len(books)
+
+    # 核心保证：所有登录都排在第一个抢座之前 —— 登录不再占用抢座窗口
+    first_book = min(i for i, e in enumerate(events) if e[0] == 'book')
+    late_logins = [e for e in logins if events.index(e) > first_book]
+    assert not late_logins, \
+        "every login must finish before the first booking; late=%s order=%s" % (
+            late_logins, events)
+
+    # 并发上限生效，且确实发生了并发（而不是退化成串行）
+    assert live['max'] <= 3, "concurrency cap exceeded: %d" % live['max']
+    assert live['max'] >= 2, \
+        "expected overlapping bookings with concurrency=3, max was %d" % live['max']
+    assert '并发 3' in output
+    print("[PASS] all logins precede bookings; concurrency respected (max %d)" % live['max'])
 
 
 if __name__ == '__main__':
@@ -879,6 +914,7 @@ if __name__ == '__main__':
         test_19_summary_reports_every_account,
         test_20_dry_run_sends_no_notification,
         test_21_appoint_dry_run_skips_booking,
+        test_22_two_phase_login_before_booking,
     ]
     passed, failed = 0, 0
     try:

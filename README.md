@@ -43,9 +43,11 @@
 ## ✨ 功能特性
 
 - 🔐 **自动登录** — Selenium headless Chrome，无需手动操作
+- ⚡ **两阶段抢座** — 先批量登录拿到会话（浏览器用完即关），再按可配置并发度抢座；**登录不占用抢座窗口**
 - 🪑 **智能选座** — 自动搜索可用座位，优先偶数编号（假设有插座）
 - 🎯 **指定座位** — 直接填座位号（自动转换ID）或座位ID，按优先级依次尝试
 - ⏰ **手动/定时预约** — 支持手动触发，也可配置 GitHub Actions 定时触发
+- 🔍 **DRY RUN 自检** — 只验证登录、不预约、不发通知，可安全验证配置与登录链路
 - 💬 **微信通知** — Server酱推送预约结果（成功含日期时间座位，失败含原因）
 - 👥 **多账号管理** — 支持多账号，每个账号可单独配置参数
 - 🖥️ **本地运行** — 支持本地直接运行，无需依赖外部服务
@@ -480,6 +482,7 @@ https://api.github.com/repos/你的用户名/ZWU_AUTO_BOOK_NEXT/actions/workflow
 | `retry-probe-count`  | int | 8              | 探路次数上限                    |
 | `retry-rush-interval` | int | 3             | 猛攻间隔（秒），系统开放后全力抢 |
 | `retry-rush-duration` | int | 60            | 猛攻持续时长（秒）              |
+| `concurrency`        | int | 3              | 抢座阶段的并发账号数。`1` = 挨个发请求（最保守），`3` = 三个一批（推荐） |
 | `cron-delta-minutes` | int | 5              | ⚠️ 已废弃，脚本启动后直接预约 |
 | `max-retry`          | int | 20             | 最大尝试次数上限                |
 | `notification_type`  | str | none           | 通知方式：none / wechat / email |
@@ -488,6 +491,12 @@ https://api.github.com/repos/你的用户名/ZWU_AUTO_BOOK_NEXT/actions/workflow
 > [!TIP]
 > **单账号最坏耗时** ≈ `retry-probe-interval × retry-probe-count + retry-rush-duration`，默认约 **4.6 分钟**（旧版固定 60 秒 × 20 次 = 20 分钟）。
 > 重试节奏设计为「探路 → 猛攻」，**不依赖系统时钟**：程序登录完就开始试，不管系统几点开放，只要在窗口内就一直在抢。
+
+> [!IMPORTANT]
+> **两阶段抢座**：程序先逐个账号登录并拿到「轻量会话」（浏览器随之关闭），
+> 之后**只发 HTTP 请求**抢座，并按 `concurrency` 分批并发。
+> 这样慢活（登录）不占用抢座窗口 —— 实测 14 个账号的出手时间从 **约 118 秒压缩到约 5 秒**。
+> 把 `concurrency` 设为 `1` 即恢复为挨个发请求（请求特征与旧版一致）。
 
 > [!NOTE]
 > **环境变量 `LOGIN_WAIT_MODE`**（可选）：默认 `url`，登录后等待 URL 跳出登录页即继续。
@@ -628,8 +637,8 @@ python update_driver.py
 ### 第 0 层：离线自测（不联网、不占座、不用账号）
 
 ```bash
-python test_config_layering.py   # 配置分层 + 账号异常隔离（21 项）
-python test_seatmap.py           # 座位号转换 + 座位信息缓存（13 项）
+python test_config_layering.py   # 配置分层 + 两阶段调度 + DRY RUN + 异常隔离（22 项）
+python test_seatmap.py           # 座位号转换 + 座位信息缓存 + 通知文案（14 项）
 python test_retry_plan.py        # 抢座重试节奏（7 项）
 ```
 
@@ -675,13 +684,13 @@ DRY RUN 汇总: 1 登录成功 / 0 失败 / 0 跳过 (共 1 个账号)
 
 ```
 ZWU_AUTO_BOOK_NEXT/
-├── demo.py                          # 入口文件
-├── zwulib.py                        # 核心库（登录/搜座/抢座）
+├── demo.py                          # 入口文件（两阶段调度：先登录，再并发抢座）
+├── zwulib.py                        # 核心库（SeatAutoBooker 负责登录 / SeatSession 负责抢座）
 ├── seatmap.py                       # 座位号→座位ID 映射转换 + 命令行查询工具
 ├── notice.py                        # 通知模块（Server酱 + 邮件）
 ├── update_driver.py                 # ChromeDriver 自动更新工具（本地用）
-├── test_config_layering.py          # 配置分层 + 账号异常隔离 + DRY RUN 测试（21项场景）
-├── test_seatmap.py                  # 座位号转换 + 座位信息缓存测试（13项场景）
+├── test_config_layering.py          # 配置分层 + 两阶段调度 + DRY RUN + 异常隔离（22项场景）
+├── test_seatmap.py                  # 座位号转换 + 座位缓存 + 通知文案测试（14项场景）
 ├── test_retry_plan.py               # 抢座重试节奏测试（7项场景）
 ├── _config.yml                      # API 配置
 ├── requirements.txt                 # Python 依赖

@@ -3,7 +3,8 @@ import os
 import time
 import yaml
 import requests
-from zwulib import appoint_zwulib
+from concurrent.futures import ThreadPoolExecutor
+from zwulib import open_session
 from notice import notify, notify_fail
 from seatmap import resolve_seats
 
@@ -28,6 +29,7 @@ DEFAULTS = {
     'retry-probe-count': 8,       # 探路次数上限
     'retry-rush-interval': 3,     # 猛攻间隔（秒）
     'retry-rush-duration': 60,    # 猛攻持续时长（秒）
+    'concurrency': 3,             # 抢座阶段的并发账号数（1 = 挨个发，最保守）
     'notification_type': 'none',
     'sckey': '',
     'smtp': {},
@@ -438,16 +440,52 @@ def _friendly_error(exc):
     return f'执行异常（{name}，详细原因见运行日志）'
 
 
-def process_account(index, total, account, defaults, max_retry=None):
+def _blank_result(username, skipped=False, reason=''):
+    """统一的账号结果结构；notified 标记用于保证同一条结果只发一次通知"""
+    return {'username': username, 'skipped': skipped, 'skip_reason': reason,
+            'session': None, 'params': {}, 'stat': None, 'msg': '',
+            'seatid': None, 'notified': False}
+
+
+def notify_result(result):
     """
-    处理单个账号：校验 → 参数合并 → 座位解析 → 预约 → 通知。
+    根据结果发通知。同一条结果只发一次（靠 notified 幂等）。
 
-    任何异常都在此捕获并转成失败结果，因此单个账号出问题不会影响其他账号
-    （例如 Chrome 启动失败时，后续账号仍会继续预约）。
-    max_retry 为 None 时使用参数合并结果中的值。
+    DRY RUN 下绝不发通知（否则会收到"预约成功"的假消息），只打印一行确认；
+    被跳过的账号不通知。
+    """
+    if result.get('notified') or result['skipped']:
+        return
+    result['notified'] = True
 
-    返回 dict: {'username', 'skipped', 'skip_reason', 'stat', 'msg', 'seatid'}
-    被跳过的账号 stat 为 None。
+    username = result['username']
+    if _is_dry_run():
+        print(f"[dry-run] {username} 登录链路"
+              + ("正常" if result['stat'] == 'ok' else f"失败: {result['msg']}"))
+        return
+
+    params = result['params']
+    if result['stat'] == 'ok':
+        try:
+            notify(username, params.get('dday', 2), result['seatid'], params)
+        except Exception as e:
+            print(f"通知发送失败: {e}")
+    else:
+        try:
+            notify_fail(username, result['msg'], params)
+        except Exception as e:
+            print(f"失败通知发送失败: {e}")
+
+
+def prepare_account(index, total, account, defaults):
+    """
+    阶段一：校验 → 参数合并 → 座位解析 → 登录拿轻量会话。
+
+    登录用的浏览器在 open_session 内部随即关闭，因此本阶段结束后只留下会话对象。
+    登录失败时 session 为 None 且已填好 stat/msg；单账号异常在此被捕获，
+    不会影响其他账号（例如 Chrome 起不来时，后续账号仍会继续登录）。
+
+    注意：本阶段只建立会话，绝不抢座。
     """
     username = account.get('username', '')
     password = account.get('password', '')
@@ -455,15 +493,13 @@ def process_account(index, total, account, defaults, max_retry=None):
     if not username or not password:
         reason = '缺少 username 或 password'
         print(f"跳过第 {index} 个账号: {reason}")
-        return {'username': username, 'skipped': True, 'skip_reason': reason,
-                'stat': None, 'msg': '', 'seatid': None}
+        return _blank_result(username, True, reason)
 
     # 停用开关（所有加载路径统一生效，未配置 enabled 默认为启用）
     if account.get('enabled', True) is False:
         reason = '已停用 (enabled=false)'
         print(f"跳过第 {index} 个账号 {username}: {reason}")
-        return {'username': username, 'skipped': True, 'skip_reason': reason,
-                'stat': None, 'msg': '', 'seatid': None}
+        return _blank_result(username, True, reason)
 
     # 合并: 账号级覆盖 > 默认配置（排除 username/password/enabled 等非预约参数）
     params = {**defaults, **{k: v for k, v in account.items()
@@ -473,51 +509,124 @@ def process_account(index, total, account, defaults, max_retry=None):
     params['seat_ids'] = resolve_final_seats(account, defaults)
 
     print(f"\n{'='*40}")
-    print(f"预约第 {index}/{total} 个账号: {username}")
+    print(f"登录第 {index}/{total} 个账号: {username}")
     print(f"自习室:{params.get('room_id')} 开始:{params.get('begin')}:00 "
           f"时长:{params.get('duration')}h 座位:{params.get('seat_ids') or '随机'}")
     print(f"{'='*40}")
 
+    result = _blank_result(username)
+    result['params'] = params
+
     try:
-        stat, msg, seatid = appoint_zwulib(
-            username, password,
-            room_id=params.get('room_id'),
-            dday=params.get('dday'),
-            begin=params.get('begin'),
-            duration=params.get('duration'),
-            seat_ids=params.get('seat_ids'),
-            cron_delta_minutes=params.get('cron-delta-minutes', 5),
-            max_retry=(params.get('max-retry', 20) if max_retry is None else max_retry),
-            probe_interval=params.get('retry-probe-interval', 30),
-            probe_count=params.get('retry-probe-count', 8),
-            rush_interval=params.get('retry-rush-interval', 3),
-            rush_duration=params.get('retry-rush-duration', 60),
-            dry_run=_is_dry_run(),
-        )
+        session, err = open_session(username, password, params.get('room_id'))
     except Exception as e:
-        # 单账号异常只影响它自己，后续账号照常处理（并补发失败通知）
         print(f"账号 {username} 执行异常: {e.__class__.__name__}: {e}")
+        result['stat'], result['msg'] = 'fail', _friendly_error(e)
+        return result
+
+    if session is None:
+        result['stat'], result['msg'] = 'fail', err or '登录失败'
+        return result
+
+    result['session'] = session
+    if _is_dry_run():
+        # DRY RUN 只验证登录，结论到此已确定
+        result['stat'], result['msg'] = 'ok', 'DRY RUN: 登录成功，未发起预约'
+    return result
+
+
+def book_session(session, params, max_retry=None):
+    """
+    用轻量会话抢座（只发 HTTP 请求，不需要浏览器）。
+
+    独立成函数是为了让测试能注入替身，而不必真的发请求。
+    """
+    return session.book(
+        params.get('dday'), params.get('begin'), params.get('duration'),
+        seat_ids=params.get('seat_ids'),
+        max_retry=(params.get('max-retry', 20) if max_retry is None else max_retry),
+        probe_interval=params.get('retry-probe-interval', 30),
+        probe_count=params.get('retry-probe-count', 8),
+        rush_interval=params.get('retry-rush-interval', 3),
+        rush_duration=params.get('retry-rush-duration', 60),
+    )
+
+
+def book_one(result, max_retry=None):
+    """阶段二单账号：抢座 → 立即通知。就地更新 result 并返回它。"""
+    username = result['username']
+    try:
+        stat, msg, seatid = book_session(result['session'], result['params'], max_retry)
+    except Exception as e:
+        # 单账号异常只影响它自己，其他账号照常处理
+        print(f"账号 {username} 抢座异常: {e.__class__.__name__}: {e}")
         stat, msg, seatid = 'fail', _friendly_error(e), None
 
-    if _is_dry_run():
-        # DRY RUN 绝不发通知，否则会收到"预约成功"的假消息
-        print(f"[dry-run] {username} 登录链路"
-              + ("正常" if stat == 'ok' else f"失败: {msg}"))
-    elif stat == "ok":
-        # 预约成功通知
-        try:
-            notify(username, params.get('dday', 2), seatid, params)
-        except Exception as e:
-            print(f"通知发送失败: {e}")
-    else:
-        # 预约失败，发送失败原因
-        try:
-            notify_fail(username, msg, params)
-        except Exception as e:
-            print(f"失败通知发送失败: {e}")
+    result['stat'], result['msg'], result['seatid'] = stat, msg, seatid
+    print(f"结果 {username}: {stat} - {msg}")
+    notify_result(result)
+    return result
 
-    return {'username': username, 'skipped': False, 'skip_reason': '',
-            'stat': stat, 'msg': msg, 'seatid': seatid}
+
+def process_account(index, total, account, defaults, max_retry=None):
+    """
+    单账号完整流程：阶段一 + 阶段二。
+
+    两阶段调度（run_all）是主流程；本函数用于单账号调用与测试，
+    走的仍是同一套 prepare_account / book_one，不复制逻辑。
+    """
+    result = prepare_account(index, total, account, defaults)
+    if result['skipped']:
+        return result
+
+    if result['session'] is None or _is_dry_run():
+        # 登录失败、或 DRY RUN 只验证登录：结论已定，直接通知（内部会跳过发送）
+        notify_result(result)
+        return result
+
+    return book_one(result, max_retry)
+
+
+def run_all(accounts, defaults, concurrency=1):
+    """
+    两阶段调度：
+
+      阶段一 逐个账号登录并产出轻量会话（慢活，浏览器用完立即关闭）
+      阶段二 用会话抢座（只发 HTTP 请求），按 concurrency 分批并发
+
+    如此「登录」不占用抢座窗口；并发只发生在最轻的抢座请求上。
+    DRY RUN 下只做阶段一，且不发送任何通知。
+    """
+    total = len(accounts)
+    results = [prepare_account(i, total, account, defaults)
+               for i, account in enumerate(accounts, 1)]
+
+    # 登录失败的账号结论已定，先通知掉（被跳过的不会通知）
+    for r in results:
+        if r['session'] is None:
+            notify_result(r)
+
+    if _is_dry_run():
+        for r in results:
+            if r['session'] is not None:
+                notify_result(r)
+        return results
+
+    ready = [r for r in results if r['session'] is not None]
+    if not ready:
+        print("\n没有账号成功登录，跳过抢座阶段")
+        return results
+
+    workers = max(1, int(concurrency))
+    print(f"\n登录完成：{len(ready)}/{total} 个账号拿到会话，"
+          f"开始抢座（并发 {workers}）")
+    t_start = time.monotonic()
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(book_one, ready))
+    finally:
+        print(f"[timer] 抢座阶段结束，耗时 {time.monotonic() - t_start:.2f}s")
+    return results
 
 
 def print_summary(results, dry_run=False):
@@ -546,6 +655,7 @@ def main():
     accounts = load_accounts()
     defaults = load_booking_config()
     dry_run = _is_dry_run()
+    concurrency = defaults.get('concurrency', 1)
 
     if not accounts:
         print("无账号配置，退出")
@@ -558,10 +668,8 @@ def main():
 
     print(f"共 {len(accounts)} 个账号待处理")
 
-    total = len(accounts)
     t_start = time.monotonic()
-    results = [process_account(i, total, account, defaults)
-               for i, account in enumerate(accounts, 1)]
+    results = run_all(accounts, defaults, concurrency=concurrency)
 
     print_summary(results, dry_run)
     print(f"[timer] 全部账号处理完毕，总耗时 {time.monotonic() - t_start:.2f}s")

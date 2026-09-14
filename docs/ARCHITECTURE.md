@@ -4,6 +4,19 @@
 > 目标：任何新接手的开发者读完本文即可定位改动点、理解调用链、明确约定与风险。
 > 生成时间：2026-09-14
 
+> [!IMPORTANT]
+> **架构已于 2026-09-14 变更：抢座改为两阶段调度，阅读本文时请注意以下差异**
+>
+> | 项 | 变更前 | 变更后 |
+> | --- | --- | --- |
+> | 抢座归属 | `SeatAutoBooker.book_favorite_seat()`（持有浏览器） | **`SeatSession.book()`（纯 HTTP，不持有浏览器）** |
+> | 单账号流程 | 登录 → 抢座 → 关浏览器（串行绑定） | **阶段一全员登录 → 阶段二并发抢座** |
+> | 调度入口 | `demo.py` 主循环内联 | **`demo.run_all(accounts, defaults, concurrency)`** |
+> | 登录入口 | — | **`zwulib.open_session()`** → 返回 `SeatSession`，浏览器随即关闭 |
+> | 并发 | 无（逐账号串行） | **可配置**，`booking_config.yml` 的 `concurrency`（默认 3，设 1 即退回串行） |
+>
+> 详细方案与实测数据见 `docs/OPTIMIZATION_PLAN.md`。下文涉及这两种结构的段落已就地更新。
+
 ---
 
 ## 1. 项目定位
@@ -237,7 +250,7 @@ python demo.py
 python seatmap.py 2 113      # 自习室114的113号 → 座位ID
 python seatmap.py 2          # 打印自习室114全部映射
 
-# 测试（零依赖，不触发真实预约，内部 mock appoint_zwulib）
+# 测试（零依赖，不触发真实预约，仅替换 open_session 这一处接缝）
 python test_config_layering.py
 python test_seatmap.py
 

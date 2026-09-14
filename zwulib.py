@@ -53,7 +53,189 @@ def room(room_id):
     return ROOM_NAMES[room_id]
 
 
+def calc_total_seconds(start_time, dday, start_hour):
+    """
+    计算预约时间的秒数偏移（基于北京时间）。
+
+    start_time 取自 _config.yml，是北京时间 1970-01-01 08:00:00（即 UTC 00:00:00）。
+    """
+    from datetime import timezone as tz
+    now_beijing = datetime.now(tz(timedelta(hours=8)))
+    today_0_clock = now_beijing.replace(hour=0, minute=0, second=0, microsecond=0)
+    book_time = today_0_clock + timedelta(days=dday) + timedelta(hours=start_hour)
+    start_beijing = (start_time.replace(tzinfo=tz(timedelta(hours=8)))
+                     if start_time.tzinfo is None else start_time)
+    return int((book_time - start_beijing).total_seconds())
+
+
+_api_config_cache = None
+
+
+def load_api_config():
+    """
+    读取 _config.yml（进程内缓存：start-time / target / headers）
+
+    注意：调用方必须对返回的 headers 做 dict() 复制后再改，
+    否则多个账号会共用同一个 dict，Cookie 互相污染。
+    """
+    global _api_config_cache
+    if _api_config_cache is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_config.yml')
+        with open(path, 'r', encoding='utf-8-sig') as f_obj:
+            _api_config_cache = yaml.safe_load(f_obj)
+    return _api_config_cache
+
+
+class SeatSession:
+    """
+    登录后的轻量会话：只保留抢座所需的 Cookie、uid 与请求头，不持有浏览器。
+
+    把「登录」与「抢座」拆开的意义：
+      - 登录慢（启动浏览器 + 交互，实测 5~18 秒/账号），可以提前全部做完，不占用抢座窗口
+      - 抢座只是 HTTP 请求，轻量且可并发，因此浏览器用完即可立即关闭
+    """
+
+    def __init__(self, username, cookie, uid, room_id, config=None):
+        self.username = username
+        self.cookie = cookie
+        self.user_data = {'uid': uid}
+        self.room_id = room_id
+        self.json = None
+        self.resp = None
+
+        cfg = config if config is not None else load_api_config()
+        self.start_time = cfg['start-time']
+        self.book_url = cfg['target']
+        self.headers = dict(cfg['headers'])  # 必须复制：缓存对象不能被子类实例改动
+        self.headers['Cookie'] = cookie
+
+    def _calc_total_seconds(self, dday, start_hour):
+        return calc_total_seconds(self.start_time, dday, start_hour)
+
+    @staticmethod
+    def _retry_intervals(max_retry, probe_interval, probe_count,
+                         rush_interval, rush_duration):
+        """
+        生成每次尝试前的等待间隔：前 probe_count 次走探路间隔，之后走猛攻间隔。
+        最后一次尝试后不再等待。返回长度不超过 max_retry 的列表。
+
+        例（默认值）：8 次 × 30s + 12 次 × 3s ≈ 4.6 分钟，而旧的固定 60s × 20 次是 20 分钟。
+        """
+        max_retry = max(1, int(max_retry))
+        probe_count = max(0, min(int(probe_count), max_retry))
+
+        intervals = [max(0, probe_interval)] * probe_count
+
+        remaining = max_retry - probe_count
+        if remaining > 0 and rush_interval > 0:
+            rush_slots = max(1, int(rush_duration // rush_interval))
+            intervals.extend([rush_interval] * min(remaining, rush_slots))
+
+        if not intervals:
+            intervals = [0]
+
+        intervals[-1] = 0  # 最后一次不再等待
+        return intervals
+
+    def _book_random_seat(self, total_seconds, duration):
+        """搜索可用座位并随机选一个（纯 HTTP，不需要浏览器）"""
+        seat_url = 'https://zjwu.huitu.zhishulib.com/Seat/Index/searchSeats?LAB_JSON=1'
+        tmpdata = f"beginTime={total_seconds}&duration={3600 * duration}&num=1&space_category%5Bcategory_id%5D=591&space_category%5Bcontent_id%5D=11"
+
+        tmpresp = requests.post(seat_url, data=tmpdata, headers=self.headers, timeout=REQUEST_TIMEOUT)
+        tmpjson = json.loads(tmpresp.text)
+
+        df = pd.DataFrame(columns=['room', 'id', 'title', 'ava'])
+        idx = 0
+        totalSeatInfo = tmpjson['allContent']['children'][2]['children']['children']
+        for i in totalSeatInfo:
+            x = i['roomName']
+            for j in i['seatMap']['POIs']:
+                df.loc[idx] = [x, j['id'], j['title'], j['state']]
+                idx += 1
+        df['id'] = df['id'].astype('int')
+        df['title'] = df['title'].astype('int')
+        df['ava'] = df['ava'].astype('int')
+
+        df = df[(df['room'] == room(self.room_id)) & (df['ava'] == 0) & (df['title'] % 2 == 0)]
+        print(f"可用座位: {len(df)} 个")
+
+        if df.empty:
+            return 'fail', '无可用座位', None
+
+        seat = random.choice(list(df['id']))
+        data = f"beginTime={total_seconds}&duration={3600 * duration}&seats[0]={seat}&seatBookers[0]={self.user_data['uid']}"
+
+        self.resp = requests.post(self.book_url, data=data, headers=self.headers, timeout=REQUEST_TIMEOUT)
+        self.json = json.loads(self.resp.text)
+        return self.json["CODE"], self.json["MESSAGE"] + " 座位:{}".format(seat), seat
+
+    def _book_specific_seats(self, total_seconds, duration, seat_ids):
+        """预约指定的座位，成功后立即停止，重复则尝试下一个"""
+        code, msg, seat_id = 'fail', '无指定座位', None
+        for seat_id in seat_ids:
+            data = f"beginTime={total_seconds}&duration={3600 * duration}&seats[0]={seat_id}&seatBookers[0]={self.user_data['uid']}"
+            print(f"预约座位 ID:{seat_id}")
+            resp = requests.post(self.book_url, data=data, headers=self.headers, timeout=REQUEST_TIMEOUT)
+            result = json.loads(resp.text)
+            code = result.get("CODE")
+            msg = result.get("MESSAGE", "")
+            print(f"  结果: {code} - {msg}")
+
+            # 预约成功，立即返回
+            if code == "ok":
+                return "ok", f"预约成功 座位:{seat_id}", seat_id
+
+            time.sleep(CANDIDATE_SEAT_INTERVAL)  # 避免请求太频繁
+
+        # 所有座位都试过了，返回最后一个结果
+        return code, msg, seat_id
+
+    def book(self, dday, start_hour, duration, seat_ids=None, max_retry=20,
+             probe_interval=DEFAULT_PROBE_INTERVAL,
+             probe_count=DEFAULT_PROBE_COUNT,
+             rush_interval=DEFAULT_RUSH_INTERVAL,
+             rush_duration=DEFAULT_RUSH_DURATION):
+        """
+        按「探路 → 猛攻」节奏重试抢座，返回 (stat, msg, seatid)
+
+        seat_ids 为 None 或空时随机选座；否则按顺序尝试每个候选座位。
+        """
+        total_seconds = self._calc_total_seconds(dday, start_hour)
+        intervals = self._retry_intervals(max_retry, probe_interval, probe_count,
+                                          rush_interval, rush_duration)
+
+        stat, msg, seatid = 'fail', '未尝试', None
+        for attempt, interval in enumerate(intervals):
+            try:
+                print(f"\n--- 第 {attempt + 1}/{len(intervals)} 次尝试 ---")
+
+                # 如果指定了座位ID，直接预约
+                if seat_ids:
+                    stat, msg, seatid = self._book_specific_seats(total_seconds, duration, seat_ids)
+                else:
+                    stat, msg, seatid = self._book_random_seat(total_seconds, duration)
+
+                # 成功或重复预约，立即返回
+                if stat == "ok" or '请勿重复预约' in msg:
+                    return stat, msg, seatid
+
+                if interval > 0:
+                    print(f"预约失败: {msg}，{interval}秒后重试...")
+                    time.sleep(interval)
+
+            except Exception as e:
+                print(f"第 {attempt + 1} 次尝试异常: {e.__class__.__name__}: {e}")
+                if interval > 0:
+                    time.sleep(interval)
+
+        # 所有重试用完
+        return stat, msg, seatid
+
+
 class SeatAutoBooker:
+    """负责用浏览器登录并取到 uid，随后交由 SeatSession 完成抢座"""
+
     def __init__(self, userID, userPass, room_id, seat_ids=None):
         self.json = None
         self.resp = None
@@ -82,162 +264,15 @@ class SeatAutoBooker:
         self.wait = WebDriverWait(self.driver, 10, 0.5)
         self.cookie = None
 
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_config.yml')
-        with open(config_path, 'r', encoding='utf-8-sig') as f_obj:
-            cfg = yaml.safe_load(f_obj)
-            self.start_time = cfg['start-time']
-            self.book_url = cfg['target']
-            self.headers = cfg['headers']
-            self.room_id = room_id
+        cfg = load_api_config()
+        self.start_time = cfg['start-time']
+        self.book_url = cfg['target']
+        self.headers = dict(cfg['headers'])  # 复制，避免多个实例共用同一 dict
+        self.room_id = room_id
 
-    def _calc_total_seconds(self, dday, start_hour):
-        """计算预约时间的秒数偏移（基于北京时间）"""
-        from datetime import timezone as tz
-        now_beijing = datetime.now(tz(timedelta(hours=8)))
-        today_0_clock = now_beijing.replace(hour=0, minute=0, second=0, microsecond=0)
-        book_time = today_0_clock + timedelta(days=dday) + timedelta(hours=start_hour)
-        # start_time 是北京时间 1970-01-01 08:00:00（即 UTC 00:00:00）
-        start_beijing = self.start_time.replace(tzinfo=tz(timedelta(hours=8))) if self.start_time.tzinfo is None else self.start_time
-        delta = book_time - start_beijing
-        return int(delta.total_seconds())
-
-    @staticmethod
-    def _retry_intervals(max_retry, probe_interval, probe_count,
-                         rush_interval, rush_duration):
-        """
-        生成每次尝试前的等待间隔：前 probe_count 次走探路间隔，之后走猛攻间隔。
-        最后一次尝试后不再等待。返回长度不超过 max_retry 的列表。
-
-        例（默认值）：8 次 × 30s + 12 次 × 3s ≈ 4.6 分钟，而旧的固定 60s × 20 次是 20 分钟。
-        """
-        max_retry = max(1, int(max_retry))
-        probe_count = max(0, min(int(probe_count), max_retry))
-
-        intervals = [max(0, probe_interval)] * probe_count
-
-        remaining = max_retry - probe_count
-        if remaining > 0 and rush_interval > 0:
-            rush_slots = max(1, int(rush_duration // rush_interval))
-            intervals.extend([rush_interval] * min(remaining, rush_slots))
-
-        if not intervals:
-            intervals = [0]
-
-        intervals[-1] = 0  # 最后一次不再等待
-        return intervals
-
-    def book_favorite_seat(self, dday, start_hour, duration, cron_delta_minutes=5,
-                           max_retry=20, probe_interval=DEFAULT_PROBE_INTERVAL,
-                           probe_count=DEFAULT_PROBE_COUNT,
-                           rush_interval=DEFAULT_RUSH_INTERVAL,
-                           rush_duration=DEFAULT_RUSH_DURATION):
-        """
-        在预约时间窗口内按「探路 → 猛攻」节奏重试预约座位
-
-        参数:
-            dday: 延后天数
-            start_hour: 开始时间小时
-            duration: 持续时长
-            cron_delta_minutes: 已废弃，保留仅为兼容旧调用
-            max_retry: 最大尝试次数
-            probe_interval: 探路间隔（秒），程序可能早于系统开放时刻启动
-            probe_count: 探路次数上限
-            rush_interval: 猛攻间隔（秒）
-            rush_duration: 猛攻持续时长（秒）
-        """
-        total_seconds = self._calc_total_seconds(dday, start_hour)
-        intervals = self._retry_intervals(max_retry, probe_interval, probe_count,
-                                          rush_interval, rush_duration)
-
-        stat, msg, seatid = 'fail', '未尝试', None
-        for attempt, interval in enumerate(intervals):
-            try:
-                print(f"\n--- 第 {attempt + 1}/{len(intervals)} 次尝试 ---")
-
-                # 如果指定了座位ID，直接预约
-                if self.seat_ids:
-                    stat, msg, seatid = self._book_specific_seats(total_seconds, duration)
-                else:
-                    stat, msg, seatid = self._book_random_seat(total_seconds, duration)
-
-                # 成功或重复预约，立即返回
-                if stat == "ok" or '请勿重复预约' in msg:
-                    return stat, msg, seatid
-
-                if interval > 0:
-                    print(f"预约失败: {msg}，{interval}秒后重试...")
-                    time.sleep(interval)
-
-            except Exception as e:
-                print(f"第 {attempt + 1} 次尝试异常: {e.__class__.__name__}: {e}")
-                if interval > 0:
-                    time.sleep(interval)
-
-        # 所有重试用完
-        return stat, msg, seatid
-
-    def _book_random_seat(self, total_seconds, duration):
-        """搜索可用座位并随机选一个"""
-        seat_url = 'https://zjwu.huitu.zhishulib.com/Seat/Index/searchSeats?LAB_JSON=1'
-        tmpdata = f"beginTime={total_seconds}&duration={3600 * duration}&num=1&space_category%5Bcategory_id%5D=591&space_category%5Bcontent_id%5D=11"
-
-        headers = self.headers.copy()
-        headers['Cookie'] = self.cookie
-        tmpresp = requests.post(seat_url, data=tmpdata, headers=headers, timeout=REQUEST_TIMEOUT)
-        tmpjson = json.loads(tmpresp.text)
-
-        df = pd.DataFrame(columns=['room', 'id', 'title', 'ava'])
-        idx = 0
-        totalSeatInfo = tmpjson['allContent']['children'][2]['children']['children']
-        for i in totalSeatInfo:
-            x = i['roomName']
-            for j in i['seatMap']['POIs']:
-                y = j['id']
-                z = j['title']
-                ava = j['state']
-                df.loc[idx] = [x, y, z, ava]
-                idx += 1
-        df['id'] = df['id'].astype('int')
-        df['title'] = df['title'].astype('int')
-        df['ava'] = df['ava'].astype('int')
-
-        df = df[(df['room'] == room(self.room_id)) & (df['ava'] == 0) & (df['title'] % 2 == 0)]
-        print(f"可用座位: {len(df)} 个")
-
-        if df.empty:
-            return 'fail', '无可用座位', None
-
-        seat = random.choice(list(df['id']))
-        data = f"beginTime={total_seconds}&duration={3600 * duration}&seats[0]={seat}&seatBookers[0]={self.user_data['uid']}"
-
-        headers = self.headers.copy()
-        headers['Cookie'] = self.cookie
-        self.resp = requests.post(self.book_url, data=data, headers=headers, timeout=REQUEST_TIMEOUT)
-        self.json = json.loads(self.resp.text)
-        return self.json["CODE"], self.json["MESSAGE"] + " 座位:{}".format(seat), seat
-
-    def _book_specific_seats(self, total_seconds, duration):
-        """预约指定的座位，成功后立即停止，重复则尝试下一个"""
-        code, msg, seat_id = 'fail', '无指定座位', None
-        for seat_id in self.seat_ids:
-            data = f"beginTime={total_seconds}&duration={3600 * duration}&seats[0]={seat_id}&seatBookers[0]={self.user_data['uid']}"
-            headers = self.headers.copy()
-            headers['Cookie'] = self.cookie
-            print(f"预约座位 ID:{seat_id}")
-            resp = requests.post(self.book_url, data=data, headers=headers, timeout=REQUEST_TIMEOUT)
-            result = json.loads(resp.text)
-            code = result.get("CODE")
-            msg = result.get("MESSAGE", "")
-            print(f"  结果: {code} - {msg}")
-
-            # 预约成功，立即返回
-            if code == "ok":
-                return "ok", f"预约成功 座位:{seat_id}", seat_id
-
-            time.sleep(CANDIDATE_SEAT_INTERVAL)  # 避免请求太频繁
-
-        # 所有座位都试过了，返回最后一个结果
-        return code, msg, seat_id
+    def to_session(self):
+        """把登录后的状态转成轻量会话，之后即可关闭浏览器（抢座不再需要它）"""
+        return SeatSession(self.un, self.cookie, self.user_data['uid'], self.room_id)
 
     def login(self):
         """登录智数图平台"""
@@ -305,6 +340,39 @@ class SeatAutoBooker:
         return 0
 
 
+def open_session(username, password, room_id):
+    """
+    启动浏览器 → 登录 → 取 UID → 产出轻量会话，随后**立即关闭浏览器**。
+
+    返回 (session, err_msg)：成功时 err_msg 为 None，登录失败时 session 为 None。
+    构造阶段的异常（如浏览器起不来）向外抛出，由调用方统一转成可读文案并做逐账号隔离。
+    """
+    t_start = time.monotonic()
+    stages = []
+    s = None
+
+    try:
+        with _stage(stages, '启动'):
+            s = SeatAutoBooker(username, password, room_id, None)
+
+        with _stage(stages, '登录'):
+            if s.login() != 0:
+                return None, '登录失败'
+
+        with _stage(stages, '取UID'):
+            if s.get_user_info() != 0:
+                return None, '获取用户信息失败'
+
+        with _stage(stages, '转会话'):
+            session = s.to_session()
+        return session, None
+    finally:
+        if s is not None:
+            with _stage(stages, '收尾'):
+                s.driver.quit()
+        _log_timer(username, stages, time.monotonic() - t_start)
+
+
 def appoint_zwulib(username, password, room_id=2, dday=2, begin=12, duration=9,
                    seat_ids=None, cron_delta_minutes=5, max_retry=20,
                    probe_interval=DEFAULT_PROBE_INTERVAL,
@@ -313,42 +381,22 @@ def appoint_zwulib(username, password, room_id=2, dday=2, begin=12, duration=9,
                    rush_duration=DEFAULT_RUSH_DURATION,
                    dry_run=False):
     """
-    预约图书馆座位（带时间窗口和重试）
+    单账号一步到位：登录 + 抢座（内部走 open_session + SeatSession.book）。
 
-    dry_run=True 时只走「启动浏览器 → 登录 → 取 UID」就返回，
-    不发起任何预约请求，用于安全地验证登录链路与采集耗时（不会占座）。
-
+    dry_run=True 时登录成功后即返回，不发起任何预约请求（不会占座）。
     返回: (stat, msg, seatid)
     """
-    t_start = time.monotonic()
-    stages = []
-    s = None
+    session, err = open_session(username, password, room_id)
+    if session is None:
+        return 'fail', err or '登录失败', None
 
-    try:
-        # 构造失败（如 Chrome 启动不了）时异常抛给上层，分阶段日志由 finally 统一打印
-        with _stage(stages, '启动'):
-            s = SeatAutoBooker(username, password, room_id, seat_ids)
+    if dry_run:
+        print("DRY RUN: 登录成功，跳过预约（未发起任何预约请求）")
+        return 'ok', 'DRY RUN: 登录成功，未发起预约', None
 
-        with _stage(stages, '登录'):
-            if s.login() != 0:
-                return 'fail', '登录失败', None
-
-        with _stage(stages, '取UID'):
-            if s.get_user_info() != 0:
-                return 'fail', '获取用户信息失败', None
-
-        if dry_run:
-            print("DRY RUN: 登录成功，跳过预约（未发起任何预约请求）")
-            return 'ok', 'DRY RUN: 登录成功，未发起预约', None
-
-        with _stage(stages, '抢座'):
-            stat, msg, seatid = s.book_favorite_seat(
-                dday, begin, duration, cron_delta_minutes, max_retry,
-                probe_interval, probe_count, rush_interval, rush_duration)
-        print(stat, msg)
-        return stat, msg, seatid
-    finally:
-        if s is not None:
-            with _stage(stages, '收尾'):
-                s.driver.quit()
-        _log_timer(username, stages, time.monotonic() - t_start)
+    stat, msg, seatid = session.book(
+        dday, begin, duration, seat_ids=seat_ids, max_retry=max_retry,
+        probe_interval=probe_interval, probe_count=probe_count,
+        rush_interval=rush_interval, rush_duration=rush_duration)
+    print(stat, msg)
+    return stat, msg, seatid

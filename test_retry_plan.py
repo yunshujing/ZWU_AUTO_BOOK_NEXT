@@ -19,10 +19,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-from zwulib import (SeatAutoBooker, DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_COUNT,
+from zwulib import (SeatSession, DEFAULT_PROBE_INTERVAL, DEFAULT_PROBE_COUNT,
                     DEFAULT_RUSH_INTERVAL, DEFAULT_RUSH_DURATION)
 
-plan = SeatAutoBooker._retry_intervals
+plan = SeatSession._retry_intervals
 
 
 def test_1_default_rhythm():

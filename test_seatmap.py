@@ -212,17 +212,24 @@ def test_10_default_level_resolution():
 
 
 def _run_main_loop_with_mock(demo, captured):
-    """Drive the REAL production loop (demo.process_account) with mocked booking.
+    """Drive the REAL production scheduler (demo.run_all) with mocked login.
 
-    Delegates to demo.process_account on purpose: a locally copied loop would keep
+    Delegates to the real scheduler on purpose: a locally copied loop would keep
     passing after demo.py changes and mask regressions.
     """
-    def fake_appoint(username, password, **kwargs):
-        captured.append({'username': username, 'seat_ids': kwargs.get('seat_ids'),
-                         'room_id': kwargs.get('room_id')})
-        return 'ok', 'mock success', 12920
+    class FakeSession:
+        def __init__(self, username):
+            self.username = username
 
-    demo.appoint_zwulib = fake_appoint
+        def book(self, dday, start_hour, duration, **kwargs):
+            captured.append({'username': self.username,
+                             'seat_ids': kwargs.get('seat_ids')})
+            return 'ok', 'mock success', 12920
+
+    def fake_open_session(username, password, room_id):
+        return FakeSession(username), None
+
+    demo.open_session = fake_open_session
     demo.notify = lambda *a, **k: None
     demo.notify_fail = lambda *a, **k: None
 
@@ -230,9 +237,7 @@ def _run_main_loop_with_mock(demo, captured):
     with redirect_stdout(f):
         accounts = demo.load_accounts()
         defaults = demo.load_booking_config()
-        total = len(accounts)
-        [demo.process_account(i, total, account, defaults)
-         for i, account in enumerate(accounts, 1)]
+        demo.run_all(accounts, defaults, concurrency=1)
     return f.getvalue()
 
 
