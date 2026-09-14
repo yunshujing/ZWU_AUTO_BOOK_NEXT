@@ -482,7 +482,7 @@ https://api.github.com/repos/你的用户名/ZWU_AUTO_BOOK_NEXT/actions/workflow
 | `retry-probe-count`  | int | 8              | 探路次数上限                    |
 | `retry-rush-interval` | int | 3             | 猛攻间隔（秒），系统开放后全力抢 |
 | `retry-rush-duration` | int | 60            | 猛攻持续时长（秒）              |
-| `concurrency`        | int | 3              | 抢座阶段的并发账号数。`1` = 挨个发请求（最保守），`3` = 三个一批 |
+| `concurrency`        | int | 1              | 抢座阶段的并发账号数。`1` = 挨个发请求（默认，最保守），`3` = 三个一批 |
 | `concurrency-jitter` | float | 0.8          | 并发时各账号出手的随机错开上限（秒），`0` = 不错开 |
 | `cron-delta-minutes` | int | 5              | ⚠️ 已废弃，脚本启动后直接预约 |
 | `max-retry`          | int | 20             | 最大尝试次数上限                |
@@ -497,7 +497,7 @@ https://api.github.com/repos/你的用户名/ZWU_AUTO_BOOK_NEXT/actions/workflow
 > **两阶段抢座**：程序先逐个账号登录并拿到「轻量会话」（浏览器随之关闭），
 > 之后**只发 HTTP 请求**抢座，并按 `concurrency` 分批并发。
 > 这样慢活（登录）不占用抢座窗口 —— 登录约占单账号 78% 的耗时，前置后 14 个账号的出手时间可从 **约 118 秒压缩到约 5 秒**。
-> 默认 `concurrency: 3`（三个一批），改动无需修改代码，随时可回退。
+> 默认 `concurrency: 1`（完全串行），需要提速时再调大。
 
 > [!WARNING]
 > **关于并发与风控**：并发会让同一出口 IP 在短时间内出现多个账号的请求。
